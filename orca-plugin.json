@@ -1,0 +1,95 @@
+{
+  "manifestVersion": 2,
+  "id": "account-token-tracker",
+  "name": "Account Token Tracker",
+  "version": "0.2.0",
+  "description": "Tracks per-account quota percentage vs actual token consumption, with weekly/monthly tokens-per-1% trends to detect quota enshittification.",
+  "author": {
+    "name": "tksuns12",
+    "url": "https://github.com/tksuns12"
+  },
+  "repository": "https://github.com/tksuns12/account-token-tracker",
+  "homepage": "https://github.com/tksuns12/account-token-tracker",
+  "license": "MIT",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "account-token-tracker",
+        "title": "Account Token Tracker",
+        "icon": "bar-chart-3",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "token-tracker",
+        "text": "Token Tracker",
+        "icon": "gauge",
+        "tone": "neutral",
+        "tooltip": "계정별 % 대비 토큰 사용량 및 주간/월간 추이 감시 (클릭하여 새로고침)",
+        "command": "refresh"
+      }
+    ],
+    "commands": [
+      {
+        "id": "refresh",
+        "title": "Account Token Tracker: Refresh Snapshot"
+      }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      }
+    ],
+    "settings": [
+      {
+        "key": "pollIntervalSec",
+        "title": "Polling interval (seconds)",
+        "description": "How often to sample account rate limits and session token counts.",
+        "type": "integer",
+        "default": 60,
+        "minimum": 15,
+        "maximum": 3600
+      },
+      {
+        "key": "maxLedgerEntries",
+        "title": "Maximum raw ledger entries",
+        "description": "Number of individual percentage-jump records to keep (weekly/monthly rollups are kept permanently).",
+        "type": "integer",
+        "default": 300,
+        "minimum": 50,
+        "maximum": 2000
+      },
+      {
+        "key": "nerfAlertDropPercent",
+        "title": "Enshittification alert threshold (% drop)",
+        "description": "Flag a warning when weekly/monthly tokens-per-1% drops by at least this percentage compared to the baseline period.",
+        "type": "integer",
+        "default": 15,
+        "minimum": 5,
+        "maximum": 80
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "history:read"
+    },
+    {
+      "kind": "agent:read"
+    }
+  ]
+}
