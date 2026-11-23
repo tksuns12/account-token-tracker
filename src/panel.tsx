@@ -4,6 +4,7 @@ import {
   Button,
   Callout,
   Card,
+  Collapsible,
   EmptyState,
   files,
   Heading,
@@ -29,6 +30,8 @@ import {
   formatProviderName,
   formatSignedPercent,
   formatTokens,
+  formatUsd,
+  summarizeTopModels,
   type DashboardView,
   type DriftStatus,
   type LedgerEntry,
@@ -124,7 +127,7 @@ function driftBadge(status: DriftStatus): {
 } {
   switch (status) {
     case 'degraded':
-      return { label: '너프 의심', tone: 'danger' }
+      return { label: '가치 하락 의심', tone: 'danger' }
     case 'watch':
       return { label: '하락 주의', tone: 'warning' }
     case 'stable':
@@ -140,22 +143,20 @@ function WindowCard(w: WindowSummaryView) {
       ? `+${w.trackedDeltaPercent}% (${w.baselinePercent}% → ${w.currentPercent}%)`
       : `0% (기준 ${w.baselinePercent}%)`
 
-  const tokenText =
-    w.pendingTokens > 0 && w.trackedDeltaPercent > 0
-      ? `${formatTokens(w.trackedTokens)} tok (대기 +${formatTokens(w.pendingTokens)})`
-      : `${formatTokens(w.trackedTokens)} tok`
-
-  const perPctText =
-    w.tokensPerPercent !== null
-      ? `${formatTokens(w.tokensPerPercent)} tok / 1%`
-      : w.trackedTokens > 0
-        ? `대기 중 (+${formatTokens(w.trackedTokens)} tok, % 변화 전)`
+  const usdPerPctText =
+    w.usdPerPercent !== null
+      ? `${formatUsd(w.usdPerPercent)} / 1%`
+      : w.trackedCostUsd > 0
+        ? `대기 중 (+${formatUsd(w.trackedCostUsd)}, % 변화 전)`
         : '데이터 수집 중'
 
-  const est100Text =
-    w.estimated100PercentTokens !== null
-      ? `약 ${formatTokens(w.estimated100PercentTokens)} tok`
-      : '-'
+  const est100UsdText =
+    w.estimated100PercentUsd !== null ? `약 ${formatUsd(w.estimated100PercentUsd)}` : '-'
+
+  const spentText =
+    w.trackedCostUsd > 0
+      ? `${formatUsd(w.trackedCostUsd)} (${formatTokens(w.trackedTokens)} tok)`
+      : `${formatTokens(w.trackedTokens)} tok`
 
   const resetText = w.resetDescription
     ? w.resetDescription
@@ -186,17 +187,36 @@ function WindowCard(w: WindowSummaryView) {
         <Progress label={`${w.windowLabel} usage`} labelHidden value={w.currentPercent} />
         <KeyValue
           items={[
-            { label: '추적 구간 Δ%', value: deltaText },
-            { label: '실제 토큰량', value: tokenText, tone: w.trackedTokens > 0 ? 'accent' : 'neutral' },
             {
-              label: '1%당 환산 토큰',
-              value: perPctText,
-              tone: w.tokensPerPercent !== null ? 'success' : 'neutral',
-              code: w.tokensPerPercent !== null
+              label: '1%당 달러 가치',
+              value: usdPerPctText,
+              tone: w.usdPerPercent !== null ? 'success' : 'neutral',
+              code: w.usdPerPercent !== null
             },
-            { label: '100% 추정 용량', value: est100Text, code: w.estimated100PercentTokens !== null }
+            {
+              label: '100% 추정 가치',
+              value: est100UsdText,
+              tone: w.estimated100PercentUsd !== null ? 'accent' : 'neutral',
+              code: w.estimated100PercentUsd !== null
+            },
+            { label: '추적 구간 Δ%', value: deltaText },
+            { label: '누적 API 환산액', value: spentText }
           ]}
         />
+        {w.modelBreakdown.length > 0 ? (
+          <Collapsible
+            title={`모델별 사용 내역 (${w.modelBreakdown.length})`}
+            defaultOpen={w.modelBreakdown.length <= 3}
+          >
+            <KeyValue
+              items={w.modelBreakdown.map((m) => ({
+                label: m.shortName,
+                value: `${formatUsd(m.costUsd)} (${Math.round(m.sharePercent)}%) · ${formatTokens(m.totalTokens)} tok`,
+                code: true
+              }))}
+            />
+          </Collapsible>
+        ) : null}
       </Stack>
     </Card>
   )
@@ -213,6 +233,11 @@ function TrendSeriesCard(s: TrendSeriesSummary) {
         : s.status === 'watch'
           ? 'warning'
           : 'success'
+
+  const fmtRate = (usd: number, tok: number) =>
+    s.metricKind === 'usd'
+      ? `${formatUsd(usd)} / 1% (100% ≈ ${formatUsd(usd * 100)})`
+      : `${formatTokens(tok)} tok / 1%`
 
   return (
     <Card
@@ -231,17 +256,17 @@ function TrendSeriesCard(s: TrendSeriesSummary) {
           items={[
             {
               label: `기준 (${s.baselinePeriodKey})`,
-              value: `${formatTokens(s.baselineTokensPerPercent)} tok / 1%`,
+              value: fmtRate(s.baselineUsdPerPercent, s.baselineTokensPerPercent),
               code: true
             },
             {
               label: `최근 (${s.latestPeriodKey})`,
-              value: `${formatTokens(s.latestTokensPerPercent)} tok / 1%`,
+              value: fmtRate(s.latestUsdPerPercent, s.latestTokensPerPercent),
               tone: baseTone,
               code: true
             },
             {
-              label: '기준 대비 변화',
+              label: '기준 대비 가치 변화',
               value: formatSignedPercent(s.vsBaselinePercent),
               tone: baseTone
             },
@@ -262,8 +287,8 @@ const TREND_COLUMNS: readonly TableColumn[] = [
   { key: 'period', label: '기간', width: 'sm' },
   { key: 'account', label: '계정 · 윈도우', width: 'md' },
   { key: 'delta', label: 'Δ%', align: 'end', width: 'xs' },
-  { key: 'perPct', label: '1%당 토큰', align: 'end', width: 'sm' },
-  { key: 'prevDiff', label: '전기간', align: 'end', width: 'xs', hideBelow: 'sm' },
+  { key: 'usdPerPct', label: '$/1%', align: 'end', width: 'sm' },
+  { key: 'est100', label: '100% 가치', align: 'end', width: 'sm', hideBelow: 'sm' },
   { key: 'baseDiff', label: '기준대비', align: 'end', width: 'sm' },
   { key: 'bar', label: '추이', width: 'sm', hideBelow: 'md' }
 ]
@@ -275,8 +300,8 @@ function toTrendRows(entries: TrendPeriodRow[]): TableRow[] {
       period: r.periodKey,
       account: `${r.accountLabel} · ${r.windowLabel}`,
       delta: `+${r.totalDeltaPercent}%`,
-      perPct: formatTokens(r.tokensPerPercent),
-      prevDiff: formatSignedPercent(r.prevChangePercent),
+      usdPerPct: r.usdPerPercent > 0 ? formatUsd(r.usdPerPercent) : `${formatTokens(r.tokensPerPercent)} tok`,
+      est100: r.estimated100PercentUsd > 0 ? formatUsd(r.estimated100PercentUsd) : '-',
       baseDiff: formatSignedPercent(r.baselineChangePercent),
       bar: r.bar
     }
@@ -286,10 +311,10 @@ function toTrendRows(entries: TrendPeriodRow[]): TableRow[] {
 const LEDGER_COLUMNS: readonly TableColumn[] = [
   { key: 'time', label: '시각', width: 'sm' },
   { key: 'account', label: '계정', width: 'md' },
-  { key: 'window', label: '윈도우', width: 'sm', hideBelow: 'sm' },
   { key: 'pct', label: '% 변화', width: 'md' },
-  { key: 'tokens', label: '토큰량', align: 'end', width: 'sm' },
-  { key: 'perPct', label: '1%당', align: 'end', width: 'sm' }
+  { key: 'usd', label: '$ 가치', align: 'end', width: 'sm' },
+  { key: 'usdPerPct', label: '$/1%', align: 'end', width: 'sm' },
+  { key: 'models', label: '사용 모델', width: 'md', hideBelow: 'sm' }
 ]
 
 function toLedgerRows(entries: LedgerEntry[]): TableRow[] {
@@ -297,11 +322,11 @@ function toLedgerRows(entries: LedgerEntry[]): TableRow[] {
     key: e.id,
     cells: {
       time: { type: 'relative', at: e.timestamp, format: 'short' },
-      account: e.accountLabel,
-      window: e.windowLabel,
+      account: `${e.accountLabel} (${e.windowLabel})`,
       pct: `${e.fromPercent}% → ${e.toPercent}% (+${e.deltaPercent}%)`,
-      tokens: `+${formatTokens(e.deltaTokens)}`,
-      perPct: `${formatTokens(e.tokensPerPercent)}`
+      usd: e.deltaCostUsd > 0 ? formatUsd(e.deltaCostUsd) : `+${formatTokens(e.deltaTokens)} tok`,
+      usdPerPct: e.usdPerPercent > 0 ? formatUsd(e.usdPerPercent) : `${formatTokens(e.tokensPerPercent)}`,
+      models: summarizeTopModels(e.models, 2)
     }
   }))
 }
@@ -375,11 +400,13 @@ export default function Panel() {
       </Row>
 
       {activeAlerts.length > 0 ? (
-        <Callout tone="danger" title="토큰 효율 하락 (Enshittification) 의심 감지" icon="warning">
+        <Callout tone="danger" title="1%당 달러 가치 하락 (Enshittification) 의심" icon="warning">
           <Stack gap="xs">
             {activeAlerts.map((a) => (
               <Text key={`${a.periodType}-${a.seriesKey}`} size="xs">
-                {`${a.accountLabel} (${a.windowLabel}, ${a.periodType === 'week' ? '주간' : '월간'}): 1%당 ${formatTokens(a.baselineTokensPerPercent)} → ${formatTokens(a.latestTokensPerPercent)} (${formatSignedPercent(a.vsBaselinePercent)})`}
+                {a.metricKind === 'usd'
+                  ? `${a.accountLabel} (${a.windowLabel}, ${a.periodType === 'week' ? '주간' : '월간'}): 1%당 가치 ${formatUsd(a.baselineUsdPerPercent)} → ${formatUsd(a.latestUsdPerPercent)} (${formatSignedPercent(a.vsBaselinePercent)})`
+                  : `${a.accountLabel} (${a.windowLabel}, ${a.periodType === 'week' ? '주간' : '월간'}): 1%당 ${formatTokens(a.baselineTokensPerPercent)} → ${formatTokens(a.latestTokensPerPercent)} (${formatSignedPercent(a.vsBaselinePercent)})`}
               </Text>
             ))}
           </Stack>
@@ -414,7 +441,7 @@ export default function Panel() {
             {filteredWindows.length === 0 ? (
               <EmptyState
                 title="추적 중인 계정이 없습니다"
-                description="지금 측정 버튼을 눌러 Orca 계정 사용률(%)과 토큰 기준점을 기록하세요."
+                description="지금 측정 버튼을 눌러 Orca 계정 사용률(%)과 모델별 달러 환산 기준점을 기록하세요."
                 icon="bar-chart-3"
               />
             ) : (
@@ -438,21 +465,21 @@ export default function Panel() {
                 onChange={(v) => set(trendGranularity, v as PeriodGranularity)}
               />
               <Text muted size="xs">
-                경고 기준: -{view?.nerfAlertDropPercent ?? 15}% 이하
+                경고 기준: $/1% -{view?.nerfAlertDropPercent ?? 15}% 이하
               </Text>
             </Row>
 
             {activeSeries.length === 0 ? (
               <EmptyState
                 title="주간/월간 추이 데이터가 아직 없습니다"
-                description="쿼터 %가 1% 이상 상승한 기록이 쌓이면 주간·월간 1%당 토큰량 변화와 기준 대비 하락률을 자동으로 감시합니다."
+                description="쿼터 %가 1% 이상 상승한 기록이 쌓이면 모델별 API 단가 기준 $/1% 변화와 가치 하락률을 자동으로 감시합니다."
                 icon="bar-chart-3"
               />
             ) : (
               <Stack gap="sm">
                 {activeSeries.map((s) => TrendSeriesCard(s))}
                 <Table
-                  label="Weekly and monthly tokens per 1% history"
+                  label="Weekly and monthly USD per 1% history"
                   columns={TREND_COLUMNS}
                   rows={toTrendRows(activeTrendRows)}
                   maxHeight="lg"
@@ -468,7 +495,7 @@ export default function Panel() {
             {filteredLedger.length === 0 ? (
               <EmptyState
                 title="아직 % 변화 기록이 없습니다"
-                description="에이전트를 사용해서 쿼터 %가 1% 이상 오르면 구간별 토큰 사용량이 자동으로 기록됩니다."
+                description="에이전트를 사용해서 쿼터 %가 1% 이상 오르면 모델별 사용량과 $/1% 환산 가치가 자동으로 기록됩니다."
                 icon="activity"
               />
             ) : (
@@ -486,7 +513,7 @@ export default function Panel() {
 
       <Row justify="between" align="center">
         <Text muted size="xs">
-          주간·월간 집계는 영구 보존됩니다
+          모델 단가는 설정(customPricingJson)에서 수정 가능
         </Text>
         <Row gap="xs">
           {isConfirmingReset ? (

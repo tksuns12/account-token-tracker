@@ -1,32 +1,33 @@
 # Account Token Tracker
 
-An [Orca](https://onorca.dev) plugin that tracks **per-account quota percentage (`%`) vs actual token consumption (`Δtokens`)**, and monitors **weekly & monthly `tokens per 1%` trends** to detect silent quota nerfs (enshittification).
+An [Orca](https://onorca.dev) plugin that tracks **per-account quota percentage (`%`) vs per-model API dollar value (`$/1%`)**, and monitors **weekly & monthly `$/1%` trends** to detect silent quota nerfs (enshittification).
 
-계정별 쿼터 사용률(`%`) 변화와 실제 에이전트 토큰 사용량(`Δtokens`)을 매칭하고, **주간/월간 1%당 토큰량 추이**를 영구 기록하여 토큰 효율 저하(enshittification)를 감시하는 Orca 플러그인입니다.
+계정별 쿼터 사용률(`%`) 변화와 **모델별 사용량 및 API 달러 환산 가치(`$/1%`)**를 추적하고, **주간/월간 `$/1%` 추이**를 영구 기록하여 구독 쿼터의 실질 가치 저하(enshittification)를 감시하는 Orca 플러그인입니다.
+
+## Why `$/1%` instead of raw tokens?
+
+A raw token count fluctuates wildly depending on whether you used Opus vs Sonnet vs Haiku, or cache reads vs output tokens. By weighting each model's `input`, `output`, `cache_write (5m / 1h)`, and `cache_read` tokens at public API rates, **Account Token Tracker** normalizes usage into **API dollar value per 1% of quota (`$/1%`)** and **estimated 100% quota value (`$`)** — making silent quota shrinkage immediately visible.
 
 ## Features
 
-- **Per-Account & Per-Window Tracking**: Polls `orca account list --json` for active/inactive accounts across supported providers (Claude, Codex, Antigravity, Gemini, OpenCode Go, Kimi, Cursor, etc.) and their 5-hour / weekly / bucket windows.
-- **Exact `Δ%` ↔ `Δtokens` Matching**: Reads local agent session token deltas via Orca's `agent.listSessions` (`history:read`). Buffers sub-1% token spend (`pendingTokens`) and flushes it into the ledger when the integer `%` ticks up, avoiding rounding loss.
+- **Per-Model Breakdown & Exact USD Valuation**:
+  - Reads local Claude Code session logs (`~/.claude/projects/*/*.jsonl`, deduplicated by `message.id` with mtime caching) for exact per-model `input`, `output`, `cache_write (5m/1h)`, and `cache_read` token pricing.
+  - Falls back to Orca's `agent.listSessions` (`history:read`) with provider blended rates for other agents.
+  - Supports custom per-model pricing overrides via the `customPricingJson` setting.
+- **Per-Account & Per-Window Tracking**: Polls `orca account list --json` for active/inactive accounts and their 5-hour / weekly / bucket windows. Sub-1% spend is buffered until `%` ticks up.
 - **Weekly & Monthly Enshittification Watch**:
-  - Permanently aggregates ISO-week (`YYYY-Www`) and monthly (`YYYY-MM`) `tokens / 1%` rollups.
+  - Permanently aggregates ISO-week (`YYYY-Www`) and monthly (`YYYY-MM`) `$/1%` rollups.
   - Compares each period against both the previous period (WoW / MoM) and your initial baseline period.
-  - Flags a warning banner and status-bar indicator when `tokens / 1%` drops below your configured threshold (default: `-15%`).
-- **Status Bar & CSV Export**: Live status bar summary (`Claude 21% · 120.0K/1%`) and one-click CSV export for both raw `%` jumps and weekly/monthly trend tables.
+  - Raises a warning banner and status-bar alert (`⚠`) when `$/1%` drops below your configured threshold (default: `-15%`).
+- **Status Bar & CSV Export**: Live status bar summary (`Claude 21% · $1.50/1%`) and one-click CSV export for both raw `%` jumps and weekly/monthly trends.
 
 ## Installation
-
-### Via Orca CLI
 
 ```bash
 orca plugin install tksuns12/account-token-tracker --json
 ```
 
-*(Because this plugin runs a `trusted-worker` to poll account quotas and read session token counts, Orca will print an approval prompt on first install. Review the requested capabilities and re-run with the `--approve <fingerprint>` flag Orca prints.)*
-
-### Via Orca Community Directory
-
-Once indexed, install directly from **Settings → Plugins** or view the listing at:
+Or view the community directory listing at:
 `https://www.onorca.dev/plugins/tksuns12/account-token-tracker`
 
 ## Requested Capabilities
@@ -34,17 +35,9 @@ Once indexed, install directly from **Settings → Plugins** or view the listing
 | Capability | Why it is needed |
 | --- | --- |
 | `storage:own` | Persists quota baselines, `%` jump ledger, and permanent weekly/monthly rollups locally. |
-| `settings:own` | Reads user settings (`pollIntervalSec`, `maxLedgerEntries`, `nerfAlertDropPercent`). |
-| `history:read` | Calls `agent.listSessions` to read per-session token totals (never conversation content). |
+| `settings:own` | Reads user settings (`pollIntervalSec`, `maxLedgerEntries`, `nerfAlertDropPercent`, `customPricingJson`). |
+| `history:read` | Calls `agent.listSessions` for agents without local JSONL breakdown (never conversation content). |
 | `agent:read` | Subscribes to `agent.status.changed` to trigger a snapshot when an agent finishes a turn. |
-
-## Settings
-
-Configure in **Settings → Plugins → Account Token Tracker**:
-
-- **Polling interval (seconds)** (`pollIntervalSec`, default `60`): Background snapshot cadence.
-- **Maximum raw ledger entries** (`maxLedgerEntries`, default `300`): Cap on individual `%` jump records (weekly/monthly rollups are kept permanently).
-- **Enshittification alert threshold (% drop)** (`nerfAlertDropPercent`, default `15`): Percentage drop vs baseline `tokens / 1%` that triggers a degradation warning.
 
 ## Development
 

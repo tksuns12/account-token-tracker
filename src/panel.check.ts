@@ -2,7 +2,7 @@ import { defineCheck } from 'orca/testing'
 import type { TrackerState } from './model'
 
 const populatedState: TrackerState = {
-  version: 2,
+  version: 3,
   lastPollAt: 1795156500000,
   lastError: null,
   windows: {
@@ -23,6 +23,29 @@ const populatedState: TrackerState = {
       trackedDeltaPercent: 3,
       trackedTokens: 360_000,
       pendingTokens: 0,
+      trackedCostUsd: 4.5,
+      pendingCostUsd: 0,
+      trackedModels: {
+        'claude-opus-5-5': {
+          inputTokens: 10_000,
+          outputTokens: 60_000,
+          cacheWrite5mTokens: 50_000,
+          cacheWrite1hTokens: 0,
+          cacheReadTokens: 100_000,
+          totalTokens: 220_000,
+          costUsd: 3.2
+        },
+        'claude-sonnet-5-5': {
+          inputTokens: 5_000,
+          outputTokens: 30_000,
+          cacheWrite5mTokens: 25_000,
+          cacheWrite1hTokens: 0,
+          cacheReadTokens: 80_000,
+          totalTokens: 140_000,
+          costUsd: 1.3
+        }
+      },
+      pendingModels: {},
       firstSeenAt: 1795150000000,
       lastUpdatedAt: 1795156500000
     }
@@ -41,6 +64,19 @@ const populatedState: TrackerState = {
       deltaPercent: 3,
       deltaTokens: 360_000,
       tokensPerPercent: 120_000,
+      deltaCostUsd: 4.5,
+      usdPerPercent: 1.5,
+      models: {
+        'claude-opus-5-5': {
+          inputTokens: 10_000,
+          outputTokens: 60_000,
+          cacheWrite5mTokens: 50_000,
+          cacheWrite1hTokens: 0,
+          cacheReadTokens: 100_000,
+          totalTokens: 220_000,
+          costUsd: 3.2
+        }
+      },
       sessionTitles: ['Refactor auth middleware']
     }
   ],
@@ -56,6 +92,8 @@ const populatedState: TrackerState = {
       windowLabel: 'Weekly (7d)',
       totalDeltaPercent: 10,
       totalDeltaTokens: 1_500_000,
+      totalDeltaCostUsd: 20.0,
+      models: {},
       sampleCount: 5,
       firstTimestamp: 1794500000000,
       lastTimestamp: 1794700000000
@@ -71,12 +109,15 @@ const populatedState: TrackerState = {
       windowLabel: 'Weekly (7d)',
       totalDeltaPercent: 8,
       totalDeltaTokens: 960_000,
+      totalDeltaCostUsd: 12.0,
+      models: {},
       sampleCount: 4,
       firstTimestamp: 1795100000000,
       lastTimestamp: 1795156500000
     }
   },
-  sessionTokens: {}
+  sessionTokens: {},
+  claudeFileOffsets: {}
 }
 
 export default defineCheck({

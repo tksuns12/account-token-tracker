@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "account-token-tracker",
   "name": "Account Token Tracker",
-  "version": "0.2.0",
-  "description": "Tracks per-account quota percentage vs actual token consumption, with weekly/monthly tokens-per-1% trends to detect quota enshittification.",
+  "version": "0.3.0",
+  "description": "Tracks per-account quota % vs per-model token breakdown and API dollar value ($/1%), with weekly/monthly trends to detect quota enshittification.",
   "author": {
     "name": "tksuns12",
     "url": "https://github.com/tksuns12"
@@ -33,7 +33,7 @@
         "text": "Token Tracker",
         "icon": "gauge",
         "tone": "neutral",
-        "tooltip": "계정별 % 대비 토큰 사용량 및 주간/월간 추이 감시 (클릭하여 새로고침)",
+        "tooltip": "계정별 % 대비 모델별 사용량 및 달러 환산 가치($/1%) 감시 (클릭하여 새로고침)",
         "command": "refresh"
       }
     ],
@@ -52,7 +52,7 @@
       {
         "key": "pollIntervalSec",
         "title": "Polling interval (seconds)",
-        "description": "How often to sample account rate limits and session token counts.",
+        "description": "How often to sample account rate limits and session usage.",
         "type": "integer",
         "default": 60,
         "minimum": 15,
@@ -70,11 +70,20 @@
       {
         "key": "nerfAlertDropPercent",
         "title": "Enshittification alert threshold (% drop)",
-        "description": "Flag a warning when weekly/monthly tokens-per-1% drops by at least this percentage compared to the baseline period.",
+        "description": "Flag a warning when weekly/monthly $/1% value drops by at least this percentage compared to the baseline period.",
         "type": "integer",
         "default": 15,
         "minimum": 5,
         "maximum": 80
+      },
+      {
+        "key": "customPricingJson",
+        "title": "Custom model pricing overrides (JSON)",
+        "description": "Optional JSON map of model ID to USD per 1M tokens, e.g. {\"claude-opus-5-5\":{\"input\":5,\"output\":25}}.",
+        "type": "string",
+        "default": "",
+        "multiline": true,
+        "placeholder": "{\"claude-opus-5-5\":{\"input\":5,\"output\":25}}"
       }
     ]
   },

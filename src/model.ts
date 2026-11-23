@@ -1,3 +1,15 @@
+import {
+  addModelUsage,
+  createEmptyModelUsage,
+  estimateBlendedCostUsd,
+  formatUsd,
+  mergeModelUsageMaps,
+  shortenModelName,
+  type ModelTokenUsage
+} from './pricing'
+
+export { formatUsd, shortenModelName, type ModelTokenUsage }
+
 export interface SessionRecord {
   sessionId: string
   agent: string
@@ -5,6 +17,8 @@ export interface SessionRecord {
   updatedAt: number
   createdAt: number | null
   totalTokens: number
+  /** Exact per-model token & USD breakdown when local logs are available. */
+  models?: Record<string, ModelTokenUsage>
 }
 
 export interface QuotaWindowSample {
@@ -38,6 +52,10 @@ export interface WindowTracker {
   trackedDeltaPercent: number
   trackedTokens: number
   pendingTokens: number
+  trackedCostUsd: number
+  pendingCostUsd: number
+  trackedModels: Record<string, ModelTokenUsage>
+  pendingModels: Record<string, ModelTokenUsage>
   firstSeenAt: number
   lastUpdatedAt: number
 }
@@ -55,6 +73,9 @@ export interface LedgerEntry {
   deltaPercent: number
   deltaTokens: number
   tokensPerPercent: number
+  deltaCostUsd: number
+  usdPerPercent: number
+  models: Record<string, ModelTokenUsage>
   sessionTitles: string[]
 }
 
@@ -71,6 +92,8 @@ export interface PeriodStat {
   windowLabel: string
   totalDeltaPercent: number
   totalDeltaTokens: number
+  totalDeltaCostUsd: number
+  models: Record<string, ModelTokenUsage>
   sampleCount: number
   firstTimestamp: number
   lastTimestamp: number
@@ -80,21 +103,38 @@ export interface StoredSessionBaseline {
   agent: string
   totalTokens: number
   updatedAt: number
+  models?: Record<string, ModelTokenUsage>
 }
 
 export interface TrackerState {
-  version: 2
+  version: 3
   lastPollAt: number | null
   lastError: string | null
   windows: Record<string, WindowTracker>
   ledger: LedgerEntry[]
   periodStats: Record<string, PeriodStat>
   sessionTokens: Record<string, StoredSessionBaseline>
+  claudeFileOffsets: Record<string, number>
+}
+
+export interface ModelBreakdownItem {
+  model: string
+  shortName: string
+  costUsd: number
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  sharePercent: number
 }
 
 export interface WindowSummaryView extends WindowTracker {
   tokensPerPercent: number | null
   estimated100PercentTokens: number | null
+  usdPerPercent: number | null
+  estimated100PercentUsd: number | null
+  modelBreakdown: ModelBreakdownItem[]
 }
 
 export type DriftStatus = 'collecting' | 'stable' | 'watch' | 'degraded'
@@ -110,8 +150,12 @@ export interface TrendPeriodRow {
   windowLabel: string
   totalDeltaPercent: number
   totalDeltaTokens: number
+  totalDeltaCostUsd: number
   tokensPerPercent: number
   estimated100PercentTokens: number
+  usdPerPercent: number
+  estimated100PercentUsd: number
+  topModelsSummary: string
   sampleCount: number
   prevChangePercent: number | null
   baselineChangePercent: number | null
@@ -129,12 +173,16 @@ export interface TrendSeriesSummary {
   periodCount: number
   baselinePeriodKey: string
   baselineTokensPerPercent: number
+  baselineUsdPerPercent: number
   latestPeriodKey: string
   latestTokensPerPercent: number
+  latestUsdPerPercent: number
   latestDeltaPercent: number
   previousTokensPerPercent: number | null
+  previousUsdPerPercent: number | null
   vsBaselinePercent: number | null
   vsPreviousPercent: number | null
+  metricKind: 'usd' | 'tokens'
   status: DriftStatus
 }
 
@@ -156,20 +204,20 @@ export interface DashboardView {
 
 export function createEmptyState(): TrackerState {
   return {
-    version: 2,
+    version: 3,
     lastPollAt: null,
     lastError: null,
     windows: {},
     ledger: [],
     periodStats: {},
-    sessionTokens: {}
+    sessionTokens: {},
+    claudeFileOffsets: {}
   }
 }
 
 /** Formats a UTC timestamp into an ISO-8601 week key such as `2026-W47`. */
 export function getIsoWeekKey(timestampMs: number): string {
   const d = new Date(timestampMs)
-  // Shift to Thursday of the same ISO week (UTC)
   const utc = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
   const day = utc.getUTCDay() || 7
   utc.setUTCDate(utc.getUTCDate() + 4 - day)
@@ -207,6 +255,8 @@ function recordPeriodRollup(
       windowLabel: entry.windowLabel,
       totalDeltaPercent: entry.deltaPercent,
       totalDeltaTokens: entry.deltaTokens,
+      totalDeltaCostUsd: entry.deltaCostUsd,
+      models: mergeModelUsageMaps({}, entry.models),
       sampleCount: 1,
       firstTimestamp: entry.timestamp,
       lastTimestamp: entry.timestamp
@@ -218,6 +268,8 @@ function recordPeriodRollup(
       windowLabel: entry.windowLabel,
       totalDeltaPercent: existing.totalDeltaPercent + entry.deltaPercent,
       totalDeltaTokens: existing.totalDeltaTokens + entry.deltaTokens,
+      totalDeltaCostUsd: existing.totalDeltaCostUsd + entry.deltaCostUsd,
+      models: mergeModelUsageMaps(existing.models ?? {}, entry.models),
       sampleCount: existing.sampleCount + 1,
       firstTimestamp: Math.min(existing.firstTimestamp, entry.timestamp),
       lastTimestamp: Math.max(existing.lastTimestamp, entry.timestamp)
@@ -225,23 +277,57 @@ function recordPeriodRollup(
   }
 }
 
-/** Upgrades a v1 or partial persisted state to v2, backfilling periodStats from ledger if needed. */
+/** Upgrades v1, v2, or partial persisted state to v3 cleanly. */
 export function migrateState(raw: unknown): TrackerState {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return createEmptyState()
   }
   const obj = raw as Partial<TrackerState> & { version?: number }
-  if (obj.version !== 1 && obj.version !== 2) {
+  if (obj.version !== 1 && obj.version !== 2 && obj.version !== 3) {
     return createEmptyState()
   }
 
-  const ledger = Array.isArray(obj.ledger) ? obj.ledger : []
-  const periodStats: Record<string, PeriodStat> =
-    obj.version === 2 && obj.periodStats && typeof obj.periodStats === 'object'
-      ? { ...obj.periodStats }
-      : {}
+  const rawLedger = Array.isArray(obj.ledger) ? obj.ledger : []
+  const ledger: LedgerEntry[] = rawLedger.map((e) => {
+    const deltaCostUsd =
+      typeof e.deltaCostUsd === 'number' && Number.isFinite(e.deltaCostUsd) ? e.deltaCostUsd : 0
+    const usdPerPercent =
+      typeof e.usdPerPercent === 'number' && Number.isFinite(e.usdPerPercent)
+        ? e.usdPerPercent
+        : e.deltaPercent > 0
+          ? deltaCostUsd / e.deltaPercent
+          : 0
+    return {
+      ...e,
+      deltaCostUsd,
+      usdPerPercent,
+      models: e.models && typeof e.models === 'object' ? e.models : {}
+    }
+  })
 
-  // Backfill periodStats from existing v1 ledger entries
+  const rawWindows = obj.windows && typeof obj.windows === 'object' ? obj.windows : {}
+  const windows: Record<string, WindowTracker> = {}
+  for (const [k, w] of Object.entries(rawWindows)) {
+    windows[k] = {
+      ...w,
+      trackedCostUsd: typeof w.trackedCostUsd === 'number' ? w.trackedCostUsd : 0,
+      pendingCostUsd: typeof w.pendingCostUsd === 'number' ? w.pendingCostUsd : 0,
+      trackedModels: w.trackedModels && typeof w.trackedModels === 'object' ? w.trackedModels : {},
+      pendingModels: w.pendingModels && typeof w.pendingModels === 'object' ? w.pendingModels : {}
+    }
+  }
+
+  const periodStats: Record<string, PeriodStat> = {}
+  if ((obj.version === 2 || obj.version === 3) && obj.periodStats && typeof obj.periodStats === 'object') {
+    for (const [k, s] of Object.entries(obj.periodStats)) {
+      periodStats[k] = {
+        ...s,
+        totalDeltaCostUsd: typeof s.totalDeltaCostUsd === 'number' ? s.totalDeltaCostUsd : 0,
+        models: s.models && typeof s.models === 'object' ? s.models : {}
+      }
+    }
+  }
+
   if (obj.version === 1 || Object.keys(periodStats).length === 0) {
     for (const entry of ledger) {
       recordPeriodRollup(periodStats, entry, 'week')
@@ -250,14 +336,18 @@ export function migrateState(raw: unknown): TrackerState {
   }
 
   return {
-    version: 2,
+    version: 3,
     lastPollAt: typeof obj.lastPollAt === 'number' ? obj.lastPollAt : null,
     lastError: typeof obj.lastError === 'string' ? obj.lastError : null,
-    windows: obj.windows && typeof obj.windows === 'object' ? obj.windows : {},
+    windows,
     ledger,
     periodStats,
     sessionTokens:
-      obj.sessionTokens && typeof obj.sessionTokens === 'object' ? obj.sessionTokens : {}
+      obj.sessionTokens && typeof obj.sessionTokens === 'object' ? obj.sessionTokens : {},
+    claudeFileOffsets:
+      obj.claudeFileOffsets && typeof obj.claudeFileOffsets === 'object'
+        ? obj.claudeFileOffsets
+        : {}
   }
 }
 
@@ -320,6 +410,49 @@ export function formatProviderName(provider: string): string {
     default:
       return provider
   }
+}
+
+export function buildModelBreakdown(
+  models: Record<string, ModelTokenUsage> | undefined
+): ModelBreakdownItem[] {
+  if (!models) return []
+  const entries = Object.entries(models).filter(([, u]) => u.totalTokens > 0 || u.costUsd > 0)
+  const totalCost = entries.reduce((sum, [, u]) => sum + u.costUsd, 0)
+  const totalTokens = entries.reduce((sum, [, u]) => sum + u.totalTokens, 0)
+
+  return entries
+    .map(([model, u]) => {
+      const sharePercent =
+        totalCost > 0
+          ? (u.costUsd / totalCost) * 100
+          : totalTokens > 0
+            ? (u.totalTokens / totalTokens) * 100
+            : 0
+      return {
+        model,
+        shortName: shortenModelName(model),
+        costUsd: u.costUsd,
+        totalTokens: u.totalTokens,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        cacheReadTokens: u.cacheReadTokens,
+        cacheWriteTokens: u.cacheWrite5mTokens + u.cacheWrite1hTokens,
+        sharePercent
+      }
+    })
+    .sort((a, b) => b.costUsd - a.costUsd || b.totalTokens - a.totalTokens)
+}
+
+export function summarizeTopModels(
+  models: Record<string, ModelTokenUsage> | undefined,
+  maxItems = 2
+): string {
+  const list = buildModelBreakdown(models)
+  if (list.length === 0) return '-'
+  return list
+    .slice(0, maxItems)
+    .map((m) => `${m.shortName} ${formatUsd(m.costUsd)}`)
+    .join(', ')
 }
 
 type RawWindow = {
@@ -534,17 +667,63 @@ function isQuotaReset(prev: WindowTracker, next: QuotaWindowSample): boolean {
   return false
 }
 
+function diffModelUsage(
+  curr: ModelTokenUsage,
+  prev: ModelTokenUsage | undefined
+): ModelTokenUsage {
+  if (!prev) return { ...curr }
+  const inputTokens = Math.max(0, curr.inputTokens - prev.inputTokens)
+  const outputTokens = Math.max(0, curr.outputTokens - prev.outputTokens)
+  const cacheWrite5mTokens = Math.max(0, curr.cacheWrite5mTokens - prev.cacheWrite5mTokens)
+  const cacheWrite1hTokens = Math.max(0, curr.cacheWrite1hTokens - prev.cacheWrite1hTokens)
+  const cacheReadTokens = Math.max(0, curr.cacheReadTokens - prev.cacheReadTokens)
+  const totalTokens = Math.max(0, curr.totalTokens - prev.totalTokens)
+  const costUsd = Math.max(0, curr.costUsd - prev.costUsd)
+  return {
+    inputTokens,
+    outputTokens,
+    cacheWrite5mTokens,
+    cacheWrite1hTokens,
+    cacheReadTokens,
+    totalTokens,
+    costUsd
+  }
+}
+
 export function applySnapshot(
   prevState: TrackerState,
   quotas: QuotaWindowSample[],
   sessions: SessionRecord[],
   now: number,
-  maxLedgerEntries = 300
+  maxLedgerEntries = 300,
+  directProviderDeltas?: Record<string, Record<string, ModelTokenUsage>>,
+  nextClaudeFileOffsets?: Record<string, number>
 ): TrackerState {
   const isBaseline = prevState.lastPollAt === null
   const nextSessionTokens: Record<string, StoredSessionBaseline> = { ...prevState.sessionTokens }
   const deltaTokensByProvider: Record<string, number> = {}
+  const deltaCostByProvider: Record<string, number> = {}
+  const deltaModelsByProvider: Record<string, Record<string, ModelTokenUsage>> = {}
   const sessionTitlesByProvider: Record<string, string[]> = {}
+
+  if (!isBaseline && directProviderDeltas) {
+    for (const [provider, models] of Object.entries(directProviderDeltas)) {
+      let sumTokens = 0
+      let sumCost = 0
+      for (const u of Object.values(models)) {
+        sumTokens += u.totalTokens
+        sumCost += u.costUsd
+      }
+      if (sumTokens > 0 || sumCost > 0) {
+        deltaTokensByProvider[provider] = (deltaTokensByProvider[provider] ?? 0) + sumTokens
+        deltaCostByProvider[provider] = (deltaCostByProvider[provider] ?? 0) + sumCost
+        deltaModelsByProvider[provider] = mergeModelUsageMaps(
+          deltaModelsByProvider[provider] ?? {},
+          models
+        )
+      }
+    }
+  }
 
   for (const s of sessions) {
     if (!s.sessionId || typeof s.totalTokens !== 'number' || s.totalTokens < 0) continue
@@ -552,22 +731,60 @@ export function applySnapshot(
     const provider = normalizeAgentToProvider(s.agent)
 
     if (!isBaseline) {
-      let delta = 0
-      if (prev) {
-        delta = Math.max(0, s.totalTokens - prev.totalTokens)
+      const cutoff = (prevState.lastPollAt ?? now) - 60_000
+      const activityTime = s.createdAt ?? s.updatedAt
+      const allowNewSession = !prev && activityTime >= cutoff
+
+      if (s.models && Object.keys(s.models).length > 0) {
+        if (prev || allowNewSession) {
+          let sessionDeltaTokens = 0
+          let sessionDeltaCost = 0
+          const providerModels = (deltaModelsByProvider[provider] ??= {})
+          for (const [modelName, usage] of Object.entries(s.models)) {
+            const d = diffModelUsage(usage, prev?.models?.[modelName])
+            if (d.totalTokens > 0 || d.costUsd > 0) {
+              sessionDeltaTokens += d.totalTokens
+              sessionDeltaCost += d.costUsd
+              providerModels[modelName] = providerModels[modelName]
+                ? addModelUsage(providerModels[modelName], d)
+                : d
+            }
+          }
+          if (sessionDeltaTokens > 0 || sessionDeltaCost > 0) {
+            deltaTokensByProvider[provider] =
+              (deltaTokensByProvider[provider] ?? 0) + sessionDeltaTokens
+            deltaCostByProvider[provider] =
+              (deltaCostByProvider[provider] ?? 0) + sessionDeltaCost
+            const list = (sessionTitlesByProvider[provider] ??= [])
+            const title = s.title?.trim()
+            if (title && !list.includes(title) && list.length < 5) list.push(title)
+          }
+        }
       } else {
-        const cutoff = (prevState.lastPollAt ?? now) - 60_000
-        const activityTime = s.createdAt ?? s.updatedAt
-        if (activityTime >= cutoff) {
+        let delta = 0
+        if (prev) {
+          delta = Math.max(0, s.totalTokens - prev.totalTokens)
+        } else if (allowNewSession) {
           delta = s.totalTokens
         }
-      }
-      if (delta > 0) {
-        deltaTokensByProvider[provider] = (deltaTokensByProvider[provider] ?? 0) + delta
-        const list = (sessionTitlesByProvider[provider] ??= [])
-        const title = s.title?.trim()
-        if (title && !list.includes(title) && list.length < 5) {
-          list.push(title)
+        if (delta > 0) {
+          const estUsd = estimateBlendedCostUsd(provider, delta)
+          deltaTokensByProvider[provider] = (deltaTokensByProvider[provider] ?? 0) + delta
+          deltaCostByProvider[provider] = (deltaCostByProvider[provider] ?? 0) + estUsd
+          const modelKey = `${provider} (est.)`
+          const providerModels = (deltaModelsByProvider[provider] ??= {})
+          const estUsage: ModelTokenUsage = {
+            ...createEmptyModelUsage(),
+            totalTokens: delta,
+            costUsd: estUsd
+          }
+          providerModels[modelKey] = providerModels[modelKey]
+            ? addModelUsage(providerModels[modelKey], estUsage)
+            : estUsage
+
+          const list = (sessionTitlesByProvider[provider] ??= [])
+          const title = s.title?.trim()
+          if (title && !list.includes(title) && list.length < 5) list.push(title)
         }
       }
     }
@@ -575,7 +792,8 @@ export function applySnapshot(
     nextSessionTokens[s.sessionId] = {
       agent: s.agent,
       totalTokens: s.totalTokens,
-      updatedAt: s.updatedAt
+      updatedAt: s.updatedAt,
+      models: s.models ? { ...s.models } : undefined
     }
   }
 
@@ -601,6 +819,12 @@ export function applySnapshot(
     const providerDeltaTokens = sample.isActiveAccount
       ? (deltaTokensByProvider[sample.provider] ?? 0)
       : 0
+    const providerDeltaCost = sample.isActiveAccount
+      ? (deltaCostByProvider[sample.provider] ?? 0)
+      : 0
+    const providerDeltaModels = sample.isActiveAccount
+      ? (deltaModelsByProvider[sample.provider] ?? {})
+      : {}
     const titles = sample.isActiveAccount ? (sessionTitlesByProvider[sample.provider] ?? []) : []
 
     if (!existing || isQuotaReset(existing, sample)) {
@@ -621,6 +845,10 @@ export function applySnapshot(
         trackedDeltaPercent: 0,
         trackedTokens: 0,
         pendingTokens: 0,
+        trackedCostUsd: 0,
+        pendingCostUsd: 0,
+        trackedModels: {},
+        pendingModels: {},
         firstSeenAt: now,
         lastUpdatedAt: now
       }
@@ -631,12 +859,23 @@ export function applySnapshot(
     let trackedDeltaPercent = existing.trackedDeltaPercent
     let trackedTokens = existing.trackedTokens
     let pendingTokens = existing.pendingTokens
+    let trackedCostUsd = existing.trackedCostUsd
+    let pendingCostUsd = existing.pendingCostUsd
+    let trackedModels = existing.trackedModels
+    let pendingModels = existing.pendingModels
 
     if (deltaPercent > 0) {
       const jumpTokens = pendingTokens + providerDeltaTokens
+      const jumpCostUsd = pendingCostUsd + providerDeltaCost
+      const jumpModels = mergeModelUsageMaps(pendingModels, providerDeltaModels)
+
       trackedDeltaPercent += deltaPercent
       trackedTokens += providerDeltaTokens
+      trackedCostUsd += providerDeltaCost
+      trackedModels = mergeModelUsageMaps(trackedModels, providerDeltaModels)
       pendingTokens = 0
+      pendingCostUsd = 0
+      pendingModels = {}
 
       const entry: LedgerEntry = {
         id: `${now}-${key}`,
@@ -651,15 +890,22 @@ export function applySnapshot(
         deltaPercent,
         deltaTokens: jumpTokens,
         tokensPerPercent: Math.round(jumpTokens / deltaPercent),
+        deltaCostUsd: jumpCostUsd,
+        usdPerPercent: jumpCostUsd / deltaPercent,
+        models: jumpModels,
         sessionTitles: titles
       }
 
       nextLedger.unshift(entry)
       recordPeriodRollup(nextPeriodStats, entry, 'week')
       recordPeriodRollup(nextPeriodStats, entry, 'month')
-    } else if (providerDeltaTokens > 0) {
+    } else if (providerDeltaTokens > 0 || providerDeltaCost > 0) {
       pendingTokens += providerDeltaTokens
       trackedTokens += providerDeltaTokens
+      pendingCostUsd += providerDeltaCost
+      trackedCostUsd += providerDeltaCost
+      pendingModels = mergeModelUsageMaps(pendingModels, providerDeltaModels)
+      trackedModels = mergeModelUsageMaps(trackedModels, providerDeltaModels)
     }
 
     nextWindows[key] = {
@@ -675,18 +921,23 @@ export function applySnapshot(
       trackedDeltaPercent,
       trackedTokens,
       pendingTokens,
+      trackedCostUsd,
+      pendingCostUsd,
+      trackedModels,
+      pendingModels,
       lastUpdatedAt: now
     }
   }
 
   return {
-    version: 2,
+    version: 3,
     lastPollAt: now,
     lastError: null,
     windows: nextWindows,
     ledger: nextLedger.slice(0, maxLedgerEntries),
     periodStats: nextPeriodStats,
-    sessionTokens: nextSessionTokens
+    sessionTokens: nextSessionTokens,
+    claudeFileOffsets: nextClaudeFileOffsets ?? prevState.claudeFileOffsets
   }
 }
 
@@ -720,15 +971,21 @@ function buildTrendsForGranularity(
   const rows: TrendPeriodRow[] = []
 
   for (const [seriesKey, items] of bySeries.entries()) {
-    // Chronological order (oldest -> newest)
     items.sort((a, b) => a.periodKey.localeCompare(b.periodKey))
-    const rates = items.map((s) => Math.round(s.totalDeltaTokens / s.totalDeltaPercent))
-    const maxRate = Math.max(...rates, 0)
-    const baselineRate = rates[0]
+
+    const tokenRates = items.map((s) => Math.round(s.totalDeltaTokens / s.totalDeltaPercent))
+    const usdRates = items.map((s) => s.totalDeltaCostUsd / s.totalDeltaPercent)
+    // Prefer USD-per-1% for enshittification detection whenever baseline has dollar data
+    const useUsd = usdRates[0] > 0 && usdRates[usdRates.length - 1] > 0
+    const primaryRates = useUsd ? usdRates : tokenRates
+    const maxPrimary = Math.max(...primaryRates, 0)
+    const baselinePrimary = primaryRates[0]
 
     const seriesRows: TrendPeriodRow[] = items.map((s, idx) => {
-      const rate = rates[idx]
-      const prevRate = idx > 0 ? rates[idx - 1] : null
+      const tRate = tokenRates[idx]
+      const uRate = usdRates[idx]
+      const pRate = primaryRates[idx]
+      const prevPrimary = idx > 0 ? primaryRates[idx - 1] : null
       return {
         key: s.key,
         periodType: s.periodType,
@@ -740,20 +997,29 @@ function buildTrendsForGranularity(
         windowLabel: s.windowLabel,
         totalDeltaPercent: s.totalDeltaPercent,
         totalDeltaTokens: s.totalDeltaTokens,
-        tokensPerPercent: rate,
-        estimated100PercentTokens: rate * 100,
+        totalDeltaCostUsd: s.totalDeltaCostUsd,
+        tokensPerPercent: tRate,
+        estimated100PercentTokens: tRate * 100,
+        usdPerPercent: uRate,
+        estimated100PercentUsd: uRate * 100,
+        topModelsSummary: summarizeTopModels(s.models, 2),
         sampleCount: s.sampleCount,
-        prevChangePercent: prevRate !== null ? pctChange(prevRate, rate) : null,
-        baselineChangePercent: idx > 0 ? pctChange(baselineRate, rate) : null,
-        bar: makeBar(rate, maxRate)
+        prevChangePercent: prevPrimary !== null ? pctChange(prevPrimary, pRate) : null,
+        baselineChangePercent: idx > 0 ? pctChange(baselinePrimary, pRate) : null,
+        bar: makeBar(pRate, maxPrimary)
       }
     })
 
     const latest = items[items.length - 1]
-    const latestRate = rates[rates.length - 1]
-    const previousRate = rates.length >= 2 ? rates[rates.length - 2] : null
-    const vsBaseline = items.length >= 2 ? pctChange(baselineRate, latestRate) : null
-    const vsPrevious = previousRate !== null ? pctChange(previousRate, latestRate) : null
+    const latestTokenRate = tokenRates[tokenRates.length - 1]
+    const latestUsdRate = usdRates[usdRates.length - 1]
+    const prevTokenRate = tokenRates.length >= 2 ? tokenRates[tokenRates.length - 2] : null
+    const prevUsdRate = usdRates.length >= 2 ? usdRates[usdRates.length - 2] : null
+    const latestPrimary = primaryRates[primaryRates.length - 1]
+    const prevPrimary = primaryRates.length >= 2 ? primaryRates[primaryRates.length - 2] : null
+
+    const vsBaseline = items.length >= 2 ? pctChange(baselinePrimary, latestPrimary) : null
+    const vsPrevious = prevPrimary !== null ? pctChange(prevPrimary, latestPrimary) : null
 
     let status: DriftStatus = 'collecting'
     if (items.length >= 2 && vsBaseline !== null) {
@@ -776,17 +1042,20 @@ function buildTrendsForGranularity(
       windowLabel: latest.windowLabel,
       periodCount: items.length,
       baselinePeriodKey: items[0].periodKey,
-      baselineTokensPerPercent: baselineRate,
+      baselineTokensPerPercent: tokenRates[0],
+      baselineUsdPerPercent: usdRates[0],
       latestPeriodKey: latest.periodKey,
-      latestTokensPerPercent: latestRate,
+      latestTokensPerPercent: latestTokenRate,
+      latestUsdPerPercent: latestUsdRate,
       latestDeltaPercent: latest.totalDeltaPercent,
-      previousTokensPerPercent: previousRate,
+      previousTokensPerPercent: prevTokenRate,
+      previousUsdPerPercent: prevUsdRate,
       vsBaselinePercent: vsBaseline,
       vsPreviousPercent: vsPrevious,
+      metricKind: useUsd ? 'usd' : 'tokens',
       status
     })
 
-    // Show newest periods first in table
     rows.push(...seriesRows.reverse())
   }
 
@@ -814,10 +1083,19 @@ export function buildDashboardView(
         w.trackedDeltaPercent > 0 ? Math.round(w.trackedTokens / w.trackedDeltaPercent) : null
       const estimated100PercentTokens =
         tokensPerPercent !== null ? tokensPerPercent * 100 : null
+      const usdPerPercent =
+        w.trackedDeltaPercent > 0 && w.trackedCostUsd > 0
+          ? w.trackedCostUsd / w.trackedDeltaPercent
+          : null
+      const estimated100PercentUsd = usdPerPercent !== null ? usdPerPercent * 100 : null
+      const modelBreakdown = buildModelBreakdown(w.trackedModels)
       return {
         ...w,
         tokensPerPercent,
-        estimated100PercentTokens
+        estimated100PercentTokens,
+        usdPerPercent,
+        estimated100PercentUsd,
+        modelBreakdown
       }
     })
     .sort((a, b) => {
@@ -835,32 +1113,35 @@ export function buildDashboardView(
   ]
 
   const primary =
+    windows.find((w) => w.isActiveAccount && w.usdPerPercent !== null) ??
     windows.find((w) => w.isActiveAccount && w.trackedDeltaPercent > 0) ??
     windows.find((w) => w.isActiveAccount) ??
     windows[0]
 
   let statusBarText = 'Token Tracker'
-  let statusBarTooltip = '계정별 % 대비 토큰 사용량 및 주간/월간 추이 감시'
+  let statusBarTooltip = '계정별 % 대비 모델별 달러 환산 가치($/1%) 감시'
   let statusBarTone: DashboardView['statusBarTone'] = 'neutral'
 
   if (primary) {
     const providerShort = formatProviderName(primary.provider)
     const ratePart =
-      primary.tokensPerPercent !== null
-        ? ` · ${formatTokens(primary.tokensPerPercent)}/1%`
-        : primary.trackedTokens > 0
-          ? ` · +${formatTokens(primary.trackedTokens)}`
-          : ''
+      primary.usdPerPercent !== null
+        ? ` · ${formatUsd(primary.usdPerPercent)}/1%`
+        : primary.trackedCostUsd > 0
+          ? ` · +${formatUsd(primary.trackedCostUsd)}`
+          : primary.tokensPerPercent !== null
+            ? ` · ${formatTokens(primary.tokensPerPercent)}/1%`
+            : ''
     const alertSuffix = degradedAlerts.length > 0 ? ' ⚠' : ''
     statusBarText = `${providerShort} ${primary.currentPercent}%${ratePart}${alertSuffix}`
     statusBarTooltip =
       `${primary.accountLabel} (${primary.windowLabel})\n` +
-      `현재 ${primary.currentPercent}% · 추적 Δ${primary.trackedDeltaPercent}% / ${formatTokens(primary.trackedTokens)} tokens` +
-      (primary.tokensPerPercent !== null
-        ? `\n1%당 약 ${formatTokens(primary.tokensPerPercent)} tokens (100% 추정: ${formatTokens(primary.estimated100PercentTokens)})`
+      `현재 ${primary.currentPercent}% · 추적 Δ${primary.trackedDeltaPercent}% / ${formatUsd(primary.trackedCostUsd)} (${formatTokens(primary.trackedTokens)} tok)` +
+      (primary.usdPerPercent !== null
+        ? `\n1%당 약 ${formatUsd(primary.usdPerPercent)} (100% 추정 가치: ${formatUsd(primary.estimated100PercentUsd)})`
         : '') +
       (degradedAlerts.length > 0
-        ? `\n⚠ 너프 의심 감지: ${degradedAlerts[0].accountLabel} (${formatSignedPercent(degradedAlerts[0].vsBaselinePercent)})`
+        ? `\n⚠ 가치 하락(Enshittification) 의심: ${degradedAlerts[0].accountLabel} (${formatSignedPercent(degradedAlerts[0].vsBaselinePercent)})`
         : '')
 
     if (degradedAlerts.length > 0 || primary.currentPercent >= 90) statusBarTone = 'danger'
@@ -894,8 +1175,11 @@ export function buildLedgerCsv(ledger: LedgerEntry[]): string {
     'from_percent',
     'to_percent',
     'delta_percent',
+    'delta_cost_usd',
+    'usd_per_1pct',
     'delta_tokens',
     'tokens_per_1pct',
+    'models',
     'sessions'
   ].join(',')
 
@@ -913,8 +1197,11 @@ export function buildLedgerCsv(ledger: LedgerEntry[]): string {
       e.fromPercent,
       e.toPercent,
       e.deltaPercent,
+      e.deltaCostUsd.toFixed(4),
+      e.usdPerPercent.toFixed(4),
       e.deltaTokens,
       e.tokensPerPercent,
+      summarizeTopModels(e.models, 5),
       e.sessionTitles.join(' | ')
     ]
       .map(escape)
@@ -932,9 +1219,12 @@ export function buildTrendsCsv(rows: TrendPeriodRow[]): string {
     'account',
     'window',
     'tracked_delta_percent',
+    'tracked_cost_usd',
+    'usd_per_1pct',
+    'estimated_100pct_usd',
     'tracked_tokens',
     'tokens_per_1pct',
-    'estimated_100pct_tokens',
+    'top_models',
     'prev_change_pct',
     'baseline_change_pct',
     'samples'
@@ -954,9 +1244,12 @@ export function buildTrendsCsv(rows: TrendPeriodRow[]): string {
       r.accountLabel,
       r.windowLabel,
       r.totalDeltaPercent,
+      r.totalDeltaCostUsd.toFixed(4),
+      r.usdPerPercent.toFixed(4),
+      r.estimated100PercentUsd.toFixed(2),
       r.totalDeltaTokens,
       r.tokensPerPercent,
-      r.estimated100PercentTokens,
+      r.topModelsSummary,
       r.prevChangePercent !== null ? r.prevChangePercent.toFixed(1) : null,
       r.baselineChangePercent !== null ? r.baselineChangePercent.toFixed(1) : null,
       r.sampleCount

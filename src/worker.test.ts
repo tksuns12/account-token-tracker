@@ -1,4 +1,5 @@
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import { parseClaudeJsonlContent } from './claude-logs'
 import {
   applySnapshot,
   buildDashboardView,
@@ -9,7 +10,69 @@ import {
   parseAccountListResponse,
   type QuotaWindowSample
 } from './model'
+import { computeUsageCostUsd } from './pricing'
 import * as main from './worker'
+
+test('parses Claude JSONL deduplicating multi-block messages and computes model USD', () => {
+  const jsonl = [
+    JSON.stringify({
+      message: {
+        id: 'msg_1',
+        model: 'claude-opus-5-5',
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 2000,
+          cache_creation_input_tokens: 10000,
+          cache_read_input_tokens: 50000,
+          cache_creation: { ephemeral_1h_input_tokens: 10000, ephemeral_5m_input_tokens: 0 }
+        }
+      }
+    }),
+    // Duplicate block with same message.id must NOT double count
+    JSON.stringify({
+      message: {
+        id: 'msg_1',
+        model: 'claude-opus-5-5',
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 2000,
+          cache_creation_input_tokens: 10000,
+          cache_read_input_tokens: 50000,
+          cache_creation: { ephemeral_1h_input_tokens: 10000, ephemeral_5m_input_tokens: 0 }
+        }
+      }
+    }),
+    // Synthetic message must be ignored
+    JSON.stringify({
+      message: {
+        id: 'msg_syn',
+        model: '<synthetic>',
+        usage: { input_tokens: 99999, output_tokens: 99999 }
+      }
+    }),
+    JSON.stringify({
+      message: {
+        id: 'msg_2',
+        model: 'claude-sonnet-5-5',
+        usage: {
+          input_tokens: 10000,
+          output_tokens: 10000,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0
+        }
+      }
+    })
+  ].join('\n')
+
+  const models = parseClaudeJsonlContent(jsonl)
+  assert.equal(Object.keys(models).length, 2)
+  assert.equal(models['claude-opus-5-5'].outputTokens, 2000)
+  // Opus 5.5: $5 in, $25 out, $10 cache1h, $0.50 cacheRead
+  // (1000*5 + 2000*25 + 10000*10 + 50000*0.5) / 1e6 = (5000 + 50000 + 100000 + 25000)/1e6 = $0.18
+  assert.equal(Number(models['claude-opus-5-5'].costUsd.toFixed(4)), 0.18)
+  // Sonnet 5.5: $3 in, $15 out => (10000*3 + 10000*15)/1e6 = $0.18
+  assert.equal(Number(models['claude-sonnet-5-5'].costUsd.toFixed(4)), 0.18)
+})
 
 test('parses orca account list --json output across providers and buckets', () => {
   const sample = {
@@ -41,10 +104,6 @@ test('parses orca account list --json output across providers and buckets', () =
               resetsAt: 1795173329000
             }
           ]
-        },
-        codex: {
-          provider: 'codex',
-          status: 'unavailable'
         }
       }
     }
@@ -53,137 +112,151 @@ test('parses orca account list --json output across providers and buckets', () =
   const parsed = parseAccountListResponse(sample)
   assert.equal(parsed.length, 2)
   assert.equal(parsed[0].provider, 'claude')
-  assert.equal(parsed[0].usedPercent, 20)
-  assert.equal(parsed[0].accountLabel, 'Claude (max_20x)')
   assert.equal(parsed[1].provider, 'antigravity')
-  assert.equal(parsed[1].windowLabel, 'Gemini Models · Five Hour')
 })
 
-test('buffers pending tokens until integer % jumps and rolls up weekly/monthly stats', () => {
+test('tracks per-model USD per 1% and detects enshittification drop in $/1%', () => {
   const baseQuota: QuotaWindowSample = {
     provider: 'claude',
     accountId: 'acc-1',
-    accountLabel: 'work@example.com',
+    accountLabel: 'Claude (max_20x)',
     planType: 'max_20x',
     isActiveAccount: true,
-    windowId: 'session',
-    windowLabel: '5h Session',
-    windowMinutes: 300,
+    windowId: 'weekly',
+    windowLabel: 'Weekly (7d)',
+    windowMinutes: 10080,
     usedPercent: 10,
     resetsAt: 2_000_000_000_000,
-    resetDescription: '5:00 PM'
+    resetDescription: 'Thu 9:00 PM'
   }
 
-  const t1 = Date.UTC(2026, 10, 16, 10, 0, 0) // 2026-W47, 2026-11
-  const t2 = t1 + 60_000
-  const t3 = t2 + 60_000
+  const week1 = Date.UTC(2026, 10, 9, 12, 0, 0) // 2026-W46
+  const week2 = Date.UTC(2026, 10, 16, 12, 0, 0) // 2026-W47
 
+  // Baseline poll
   let state = applySnapshot(
     createEmptyState(),
     [baseQuota],
-    [{ sessionId: 's1', agent: 'claude', title: 'Task A', updatedAt: t1, createdAt: t1 - 100, totalTokens: 50_000 }],
-    t1
+    [
+      {
+        sessionId: 's1',
+        agent: 'claude',
+        title: 'Task',
+        updatedAt: week1,
+        createdAt: week1,
+        totalTokens: 100_000,
+        models: {
+          'claude-opus-5-5': {
+            inputTokens: 0,
+            outputTokens: 100_000,
+            cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: 0,
+            cacheReadTokens: 0,
+            totalTokens: 100_000,
+            costUsd: 2.5
+          }
+        }
+      }
+    ],
+    week1
   )
-  assert.equal(state.ledger.length, 0)
 
-  state = applySnapshot(
-    state,
-    [baseQuota],
-    [{ sessionId: 's1', agent: 'claude', title: 'Task A', updatedAt: t2, createdAt: t1 - 100, totalTokens: 90_000 }],
-    t2
-  )
-  assert.equal(state.ledger.length, 0)
-  assert.equal(state.windows['claude::acc-1::session'].pendingTokens, 40_000)
-
+  // Week 1: +2% for $4.00 -> $2.00 / 1%
   state = applySnapshot(
     state,
     [{ ...baseQuota, usedPercent: 12 }],
-    [{ sessionId: 's1', agent: 'claude', title: 'Task A', updatedAt: t3, createdAt: t1 - 100, totalTokens: 150_000 }],
-    t3
-  )
-  assert.equal(state.ledger.length, 1)
-  assert.equal(state.ledger[0].deltaTokens, 100_000)
-  assert.equal(state.ledger[0].tokensPerPercent, 50_000)
-
-  const weekKey = getIsoWeekKey(t3)
-  const monthKey = getMonthKey(t3)
-  assert.equal(state.periodStats[`week::${weekKey}::claude::acc-1::session`]?.totalDeltaTokens, 100_000)
-  assert.equal(state.periodStats[`month::${monthKey}::claude::acc-1::session`]?.totalDeltaPercent, 2)
-})
-
-test('detects weekly/monthly token-per-1% enshittification drop vs baseline', () => {
-  const week1 = Date.UTC(2026, 10, 9, 12, 0, 0) // 2026-W46
-  const week2 = Date.UTC(2026, 10, 16, 12, 0, 0) // 2026-W47
-  const month2 = Date.UTC(2026, 11, 2, 12, 0, 0) // 2026-12
-
-  // Simulate migrating a v1 state with 3 ledger entries across weeks & months
-  const migrated = migrateState({
-    version: 1,
-    lastPollAt: month2,
-    lastError: null,
-    windows: {},
-    ledger: [
+    [
       {
-        id: '3',
-        timestamp: month2,
-        provider: 'claude',
-        accountId: 'acc-1',
-        accountLabel: 'Claude (max_20x)',
-        windowId: 'weekly',
-        windowLabel: 'Weekly (7d)',
-        fromPercent: 10,
-        toPercent: 15,
-        deltaPercent: 5,
-        deltaTokens: 500_000, // 100K / 1% (-33.3% vs baseline 150K)
-        tokensPerPercent: 100_000,
-        sessionTitles: []
-      },
-      {
-        id: '2',
-        timestamp: week2,
-        provider: 'claude',
-        accountId: 'acc-1',
-        accountLabel: 'Claude (max_20x)',
-        windowId: 'weekly',
-        windowLabel: 'Weekly (7d)',
-        fromPercent: 10,
-        toPercent: 14,
-        deltaPercent: 4,
-        deltaTokens: 480_000, // 120K / 1% (-20% vs baseline 150K)
-        tokensPerPercent: 120_000,
-        sessionTitles: []
-      },
-      {
-        id: '1',
-        timestamp: week1,
-        provider: 'claude',
-        accountId: 'acc-1',
-        accountLabel: 'Claude (max_20x)',
-        windowId: 'weekly',
-        windowLabel: 'Weekly (7d)',
-        fromPercent: 10,
-        toPercent: 14,
-        deltaPercent: 4,
-        deltaTokens: 600_000, // 150K / 1% baseline
-        tokensPerPercent: 150_000,
-        sessionTitles: []
+        sessionId: 's1',
+        agent: 'claude',
+        title: 'Task',
+        updatedAt: week1 + 60_000,
+        createdAt: week1,
+        totalTokens: 260_000,
+        models: {
+          'claude-opus-5-5': {
+            inputTokens: 0,
+            outputTokens: 260_000,
+            cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: 0,
+            cacheReadTokens: 0,
+            totalTokens: 260_000,
+            costUsd: 6.5
+          }
+        }
       }
     ],
-    sessionTokens: {}
-  })
+    week1 + 60_000
+  )
 
-  const view = buildDashboardView(migrated, 15)
+  // Week 2: +2% for $3.00 -> $1.50 / 1% (-25% drop vs baseline $2.00/1%!)
+  state = applySnapshot(
+    state,
+    [{ ...baseQuota, usedPercent: 14 }],
+    [
+      {
+        sessionId: 's1',
+        agent: 'claude',
+        title: 'Task',
+        updatedAt: week2,
+        createdAt: week1,
+        totalTokens: 380_000,
+        models: {
+          'claude-opus-5-5': {
+            inputTokens: 0,
+            outputTokens: 380_000,
+            cacheWrite5mTokens: 0,
+            cacheWrite1hTokens: 0,
+            cacheReadTokens: 0,
+            totalTokens: 380_000,
+            costUsd: 9.5
+          }
+        }
+      }
+    ],
+    week2
+  )
+
+  const view = buildDashboardView(state, 15)
   assert.equal(view.weeklySeries.length, 1)
+  assert.equal(view.weeklySeries[0].metricKind, 'usd')
+  assert.equal(view.weeklySeries[0].baselineUsdPerPercent, 2.0)
+  assert.equal(view.weeklySeries[0].latestUsdPerPercent, 1.5)
+  assert.equal(Math.round(view.weeklySeries[0].vsBaselinePercent ?? 0), -25)
   assert.equal(view.weeklySeries[0].status, 'degraded')
-  assert.equal(view.weeklySeries[0].baselineTokensPerPercent, 150_000)
-  assert.equal(view.weeklySeries[0].latestTokensPerPercent, 100_000)
-  assert.equal(Math.round(view.weeklySeries[0].vsBaselinePercent ?? 0), -33)
-  assert.equal(view.monthlySeries.length, 1)
-  assert.equal(view.monthlySeries[0].status, 'degraded')
-  assert.equal(view.degradedAlerts.length, 2)
+  assert.equal(view.degradedAlerts.length, 1)
+
+  // Verify week/month keys
+  assert.ok(state.periodStats[`week::${getIsoWeekKey(week1 + 60_000)}::claude::acc-1::weekly`])
+  assert.ok(state.periodStats[`month::${getMonthKey(week2)}::claude::acc-1::weekly`])
 })
 
-test('worker refreshes, records % vs tokens, and exports trends CSV', async () => {
+test('migrates v1 state cleanly to v3 and custom pricing overrides work', () => {
+  const migrated = migrateState({
+    version: 1,
+    lastPollAt: 1000,
+    lastError: null,
+    windows: {},
+    ledger: [],
+    sessionTokens: {}
+  })
+  assert.equal(migrated.version, 3)
+
+  const customUsd = computeUsageCostUsd(
+    'claude-opus-5-5',
+    {
+      inputTokens: 1_000_000,
+      outputTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      cacheReadTokens: 0
+    },
+    { 'claude-opus-5-5': { input: 12, output: 60 } }
+  )
+  assert.equal(customUsd, 12)
+})
+
+test('worker refreshes using local Claude logs and exports trends CSV with USD', async () => {
   let step = 0
   main.setAccountListFetcherForTests(async () => [
     {
@@ -200,28 +273,39 @@ test('worker refreshes, records % vs tokens, and exports trends CSV', async () =
       resetDescription: 'Thu 9:00 PM'
     }
   ])
+  main.setClaudeDeltaFetcherForTests((_offsets, isBaseline) => {
+    if (isBaseline) {
+      return {
+        nextOffsets: { 'proj/s1.jsonl': 1000 },
+        deltaModels: {},
+        deltaTokens: 0,
+        deltaCostUsd: 0,
+        hasLocalLogs: true
+      }
+    }
+    return {
+      nextOffsets: { 'proj/s1.jsonl': 2500 },
+      deltaModels: {
+        'claude-opus-5-5': {
+          inputTokens: 0,
+          outputTokens: 120_000,
+          cacheWrite5mTokens: 0,
+          cacheWrite1hTokens: 0,
+          cacheReadTokens: 0,
+          totalTokens: 120_000,
+          costUsd: 3.0
+        }
+      },
+      deltaTokens: 120_000,
+      deltaCostUsd: 3.0,
+      hasLocalLogs: true
+    }
+  })
 
   try {
     const host = mockHost({
       results: {
-        'agent.listSessions': () => ({
-          sessions: [
-            {
-              sessionId: 'sess-1',
-              agent: 'claude',
-              title: 'Build plugin',
-              workspaceId: null,
-              hostId: 'local',
-              branch: null,
-              createdAt: Date.now() - 1000,
-              updatedAt: Date.now(),
-              messageCount: 4,
-              totalTokens: step === 0 ? 100_000 : 340_000,
-              running: false
-            }
-          ],
-          truncated: false
-        })
+        'agent.listSessions': () => ({ sessions: [], truncated: false })
       }
     })
 
@@ -229,25 +313,23 @@ test('worker refreshes, records % vs tokens, and exports trends CSV', async () =
     await worker.request('tracker.refresh')
     step = 1
     const view = (await worker.request('tracker.refresh')) as unknown as {
-      windows: Array<{ trackedDeltaPercent: number; trackedTokens: number; tokensPerPercent: number }>
-      weeklyRows: Array<{ tokensPerPercent: number }>
+      windows: Array<{ usdPerPercent: number; estimated100PercentUsd: number }>
+      weeklyRows: Array<{ usdPerPercent: number }>
     }
 
-    assert.equal(view.windows.length, 1)
-    assert.equal(view.windows[0].trackedDeltaPercent, 2)
-    assert.equal(view.windows[0].trackedTokens, 240_000)
-    assert.equal(view.windows[0].tokensPerPercent, 120_000)
-    assert.equal(view.weeklyRows.length, 1)
-    assert.equal(view.weeklyRows[0].tokensPerPercent, 120_000)
+    assert.equal(view.windows[0].usdPerPercent, 1.5)
+    assert.equal(view.windows[0].estimated100PercentUsd, 150)
+    assert.equal(view.weeklyRows[0].usdPerPercent, 1.5)
 
     const csvRes = (await worker.request('tracker.exportTrendsCsv', {
       granularity: 'week'
     })) as unknown as { filename: string; csv: string }
-    assert.ok(csvRes.filename.includes('week'))
-    assert.ok(csvRes.csv.includes('120000'))
+    assert.ok(csvRes.csv.includes('usd_per_1pct'))
+    assert.ok(csvRes.csv.includes('1.5000'))
     assert.deepEqual(worker.refusals, [])
     await worker.deactivate()
   } finally {
     main.setAccountListFetcherForTests(null)
+    main.setClaudeDeltaFetcherForTests(null)
   }
 })

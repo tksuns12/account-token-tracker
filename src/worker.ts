@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { OrcaWorkerApi } from 'orca/worker'
+import { scanClaudeLocalDeltas, type ClaudeDeltaScanResult } from './claude-logs'
 import {
   applySnapshot,
   buildDashboardView,
@@ -8,12 +9,15 @@ import {
   buildTrendsCsv,
   createEmptyState,
   migrateState,
+  normalizeAgentToProvider,
   parseAccountListResponse,
   type DashboardView,
+  type ModelTokenUsage,
   type QuotaWindowSample,
   type SessionRecord,
   type TrackerState
 } from './model'
+import { parseCustomPricing, type CustomPricingOverrides } from './pricing'
 
 const execFileAsync = promisify(execFile)
 
@@ -23,8 +27,15 @@ const DEFAULT_MAX_LEDGER = 300
 const DEFAULT_NERF_ALERT_DROP = 15
 
 export type AccountListFetcher = () => Promise<QuotaWindowSample[]>
+export type LocalClaudeDeltaFetcher = (
+  prevOffsets: Record<string, number>,
+  isBaseline: boolean,
+  lastPollAt: number | null,
+  overrides?: CustomPricingOverrides
+) => ClaudeDeltaScanResult
 
 let customFetcher: AccountListFetcher | null = null
+let customClaudeDeltaFetcher: LocalClaudeDeltaFetcher | null = null
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let inFlightRefresh: Promise<DashboardView> | null = null
@@ -33,6 +44,11 @@ let deactivated = false
 /** Allows unit tests to inject a mock account list fetcher instead of spawning `orca`. */
 export function setAccountListFetcherForTests(fetcher: AccountListFetcher | null): void {
   customFetcher = fetcher
+}
+
+/** Allows unit tests to inject a mock incremental Claude JSONL scanner. */
+export function setClaudeDeltaFetcherForTests(fetcher: LocalClaudeDeltaFetcher | null): void {
+  customClaudeDeltaFetcher = fetcher
 }
 
 async function fetchAccountQuotasFromCli(): Promise<QuotaWindowSample[]> {
@@ -55,6 +71,7 @@ async function readSettings(orca: OrcaWorkerApi): Promise<{
   pollIntervalSec: number
   maxLedgerEntries: number
   nerfAlertDropPercent: number
+  customPricing: CustomPricingOverrides
 }> {
   try {
     const all = await orca.settings.get()
@@ -70,12 +87,19 @@ async function readSettings(orca: OrcaWorkerApi): Promise<{
       typeof all.nerfAlertDropPercent === 'number' && all.nerfAlertDropPercent >= 5
         ? all.nerfAlertDropPercent
         : DEFAULT_NERF_ALERT_DROP
-    return { pollIntervalSec: poll, maxLedgerEntries: maxLedger, nerfAlertDropPercent: nerfDrop }
+    const customPricing = parseCustomPricing(all.customPricingJson)
+    return {
+      pollIntervalSec: poll,
+      maxLedgerEntries: maxLedger,
+      nerfAlertDropPercent: nerfDrop,
+      customPricing
+    }
   } catch {
     return {
       pollIntervalSec: DEFAULT_POLL_SEC,
       maxLedgerEntries: DEFAULT_MAX_LEDGER,
-      nerfAlertDropPercent: DEFAULT_NERF_ALERT_DROP
+      nerfAlertDropPercent: DEFAULT_NERF_ALERT_DROP,
+      customPricing: {}
     }
   }
 }
@@ -93,21 +117,74 @@ async function updateStatusBar(orca: OrcaWorkerApi, view: DashboardView): Promis
   }
 }
 
-async function fetchSessions(orca: OrcaWorkerApi): Promise<SessionRecord[]> {
-  if (!orca.host.has('agent.listSessions')) return []
+async function collectUsageData(
+  orca: OrcaWorkerApi,
+  prevState: TrackerState,
+  customPricing: CustomPricingOverrides
+): Promise<{
+  sessions: SessionRecord[]
+  directProviderDeltas: Record<string, Record<string, ModelTokenUsage>>
+  nextClaudeOffsets: Record<string, number>
+}> {
+  const isBaseline = prevState.lastPollAt === null
+
+  let claudeDelta: ClaudeDeltaScanResult = {
+    nextOffsets: prevState.claudeFileOffsets,
+    deltaModels: {},
+    deltaTokens: 0,
+    deltaCostUsd: 0,
+    hasLocalLogs: false
+  }
   try {
-    const res = await orca.host.call('agent.listSessions', { limit: 200 })
-    return res.sessions.map((s) => ({
-      sessionId: s.sessionId,
-      agent: s.agent,
-      title: s.title,
-      updatedAt: s.updatedAt,
-      createdAt: s.createdAt,
-      totalTokens: s.totalTokens
-    }))
+    claudeDelta = customClaudeDeltaFetcher
+      ? customClaudeDeltaFetcher(
+          prevState.claudeFileOffsets,
+          isBaseline,
+          prevState.lastPollAt,
+          customPricing
+        )
+      : scanClaudeLocalDeltas(
+          prevState.claudeFileOffsets,
+          isBaseline,
+          prevState.lastPollAt,
+          customPricing
+        )
   } catch (err) {
-    orca.log(`agent.listSessions failed: ${String(err)}`)
-    return []
+    orca.log(`scanClaudeLocalDeltas failed: ${String(err)}`)
+  }
+
+  const directProviderDeltas: Record<string, Record<string, ModelTokenUsage>> = {}
+  if (Object.keys(claudeDelta.deltaModels).length > 0) {
+    directProviderDeltas.claude = claudeDelta.deltaModels
+  }
+
+  const sessions: SessionRecord[] = []
+  if (orca.host.has('agent.listSessions')) {
+    try {
+      const res = await orca.host.call('agent.listSessions', { limit: 200 })
+      for (const s of res.sessions) {
+        // Avoid double-counting Claude when local JSONL logs are being tailed directly
+        if (claudeDelta.hasLocalLogs && normalizeAgentToProvider(s.agent) === 'claude') {
+          continue
+        }
+        sessions.push({
+          sessionId: s.sessionId,
+          agent: s.agent,
+          title: s.title,
+          updatedAt: s.updatedAt,
+          createdAt: s.createdAt,
+          totalTokens: s.totalTokens
+        })
+      }
+    } catch (err) {
+      orca.log(`agent.listSessions failed: ${String(err)}`)
+    }
+  }
+
+  return {
+    sessions,
+    directProviderDeltas,
+    nextClaudeOffsets: claudeDelta.nextOffsets
   }
 }
 
@@ -115,14 +192,22 @@ async function runRefresh(orca: OrcaWorkerApi): Promise<DashboardView> {
   if (inFlightRefresh) return inFlightRefresh
   inFlightRefresh = (async () => {
     const prev = await loadState(orca)
-    const { maxLedgerEntries, nerfAlertDropPercent } = await readSettings(orca)
+    const { maxLedgerEntries, nerfAlertDropPercent, customPricing } = await readSettings(orca)
     const now = Date.now()
     try {
-      const [quotas, sessions] = await Promise.all([
+      const [quotas, usageData] = await Promise.all([
         fetchAccountQuotasFromCli(),
-        fetchSessions(orca)
+        collectUsageData(orca, prev, customPricing)
       ])
-      const next = applySnapshot(prev, quotas, sessions, now, maxLedgerEntries)
+      const next = applySnapshot(
+        prev,
+        quotas,
+        usageData.sessions,
+        now,
+        maxLedgerEntries,
+        usageData.directProviderDeltas,
+        usageData.nextClaudeOffsets
+      )
       await orca.storage.set(STATE_KEY, next as unknown as Record<string, never>)
       const view = buildDashboardView(next, nerfAlertDropPercent)
       await updateStatusBar(orca, view)
@@ -226,7 +311,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.settings.onDidChange(async ({ key }) => {
     if (key === 'pollIntervalSec') {
       void startPolling()
-    } else if (key === 'nerfAlertDropPercent') {
+    } else if (key === 'nerfAlertDropPercent' || key === 'customPricingJson') {
       const [state, { nerfAlertDropPercent }] = await Promise.all([
         loadState(orca),
         readSettings(orca)

@@ -6,7 +6,7 @@ const mockView: DashboardView = {
   lastPollAt: 1795156500000,
   lastError: null,
   nerfAlertDropPercent: 15,
-  statusBarText: 'Claude 21% · 120.0K/1% ⚠',
+  statusBarText: 'Claude 21% · $1.50/1% ⚠',
   statusBarTooltip: 'Claude (max_20x)',
   statusBarTone: 'danger',
   windows: [
@@ -27,10 +27,29 @@ const mockView: DashboardView = {
       trackedDeltaPercent: 3,
       trackedTokens: 360_000,
       pendingTokens: 0,
+      trackedCostUsd: 4.5,
+      pendingCostUsd: 0,
+      trackedModels: {},
+      pendingModels: {},
       firstSeenAt: 1795150000000,
       lastUpdatedAt: 1795156500000,
       tokensPerPercent: 120_000,
-      estimated100PercentTokens: 12_000_000
+      estimated100PercentTokens: 12_000_000,
+      usdPerPercent: 1.5,
+      estimated100PercentUsd: 150,
+      modelBreakdown: [
+        {
+          model: 'claude-opus-5-5',
+          shortName: 'opus-5-5',
+          costUsd: 3.2,
+          totalTokens: 220_000,
+          inputTokens: 10_000,
+          outputTokens: 60_000,
+          cacheReadTokens: 100_000,
+          cacheWriteTokens: 50_000,
+          sharePercent: 71.1
+        }
+      ]
     }
   ],
   ledger: [
@@ -47,6 +66,9 @@ const mockView: DashboardView = {
       deltaPercent: 3,
       deltaTokens: 360_000,
       tokensPerPercent: 120_000,
+      deltaCostUsd: 4.5,
+      usdPerPercent: 1.5,
+      models: {},
       sessionTitles: ['Build plugin']
     }
   ],
@@ -62,12 +84,16 @@ const mockView: DashboardView = {
       periodCount: 2,
       baselinePeriodKey: '2026-W46',
       baselineTokensPerPercent: 150_000,
+      baselineUsdPerPercent: 2.0,
       latestPeriodKey: '2026-W47',
       latestTokensPerPercent: 120_000,
+      latestUsdPerPercent: 1.5,
       latestDeltaPercent: 8,
       previousTokensPerPercent: 150_000,
-      vsBaselinePercent: -20,
-      vsPreviousPercent: -20,
+      previousUsdPerPercent: 2.0,
+      vsBaselinePercent: -25,
+      vsPreviousPercent: -25,
+      metricKind: 'usd',
       status: 'degraded'
     }
   ],
@@ -83,11 +109,15 @@ const mockView: DashboardView = {
       windowLabel: 'Weekly (7d)',
       totalDeltaPercent: 8,
       totalDeltaTokens: 960_000,
+      totalDeltaCostUsd: 12.0,
       tokensPerPercent: 120_000,
       estimated100PercentTokens: 12_000_000,
+      usdPerPercent: 1.5,
+      estimated100PercentUsd: 150,
+      topModelsSummary: 'opus-5-5 $12.00',
       sampleCount: 4,
-      prevChangePercent: -20,
-      baselineChangePercent: -20,
+      prevChangePercent: -25,
+      baselineChangePercent: -25,
       bar: '████████░░'
     }
   ],
@@ -105,18 +135,22 @@ const mockView: DashboardView = {
       periodCount: 2,
       baselinePeriodKey: '2026-W46',
       baselineTokensPerPercent: 150_000,
+      baselineUsdPerPercent: 2.0,
       latestPeriodKey: '2026-W47',
       latestTokensPerPercent: 120_000,
+      latestUsdPerPercent: 1.5,
       latestDeltaPercent: 8,
       previousTokensPerPercent: 150_000,
-      vsBaselinePercent: -20,
-      vsPreviousPercent: -20,
+      previousUsdPerPercent: 2.0,
+      vsBaselinePercent: -25,
+      vsPreviousPercent: -25,
+      metricKind: 'usd',
       status: 'degraded'
     }
   ]
 }
 
-test('renders enshittification alert, account card, and weekly/monthly trends tab', async () => {
+test('renders USD/1% value, model breakdown, enshittification alert, and refresh', async () => {
   let refreshed = false
   const host = mockHost({
     requests: {
@@ -134,7 +168,8 @@ test('renders enshittification alert, account card, and weekly/monthly trends ta
   const kv = view.find({ type: 'KeyValue' })
   assert.ok(kv)
   const items = kv.props.items as Array<{ label: string; value: string }>
-  assert.equal(items.find((i) => i.label === '1%당 환산 토큰')?.value, '120.0K tok / 1%')
+  assert.equal(items.find((i) => i.label === '1%당 달러 가치')?.value, '$1.50 / 1%')
+  assert.equal(items.find((i) => i.label === '100% 추정 가치')?.value, '약 $150')
 
   await view.press({ text: '지금 측정' })
   assert.equal(refreshed, true)
