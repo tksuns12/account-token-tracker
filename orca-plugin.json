@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "account-token-tracker",
   "name": "Account Token Tracker",
-  "version": "0.3.5",
-  "description": "Tracks per-account quota % and per-model usage, estimating monthly dollar value ($/mo) week-over-week and month-over-month to detect quota enshittification.",
+  "version": "0.4.0",
+  "description": "Track per-account quota % vs real API dollar value ($/mo), visualize model cost mix, and detect silent quota nerfs week-over-week.",
   "author": {
     "name": "tksuns12",
     "url": "https://github.com/tksuns12"
@@ -11,6 +11,31 @@
   "repository": "https://github.com/tksuns12/account-token-tracker",
   "homepage": "https://github.com/tksuns12/account-token-tracker",
   "license": "MIT",
+  "icon": "assets/icon.png",
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "Account Token Tracker sidebar dashboard showing grouped account quota bars, model cost mix, and weekly dollar value drift SVG chart"
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot-overview.png",
+      "alt": "Grouped account cards with quota progress bars, reset countdowns, and color-coded model cost stacked bars in dark and light themes",
+      "caption": "Account Overview & Model Cost Mix (Dark & Light Themes)",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/screenshot-trends.png",
+      "alt": "Weekly and monthly SVG drift charts tracking estimated monthly dollar value against baseline and -15% alert threshold",
+      "caption": "Weekly & Monthly Value Drift Watch (Enshittification Detection)",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/screenshot-ledger.png",
+      "alt": "Expandable percentage jump ledger with per-model Input, Output, and Cache token breakdown and automatic outlier exclusion badges",
+      "caption": "Expandable % Jump Ledger & Automatic Outlier Guard",
+      "theme": "dark"
+    }
+  ],
   "engines": {
     "orca": ">=1.4.259"
   },
@@ -23,8 +48,7 @@
         "id": "account-token-tracker",
         "title": "Account Token Tracker",
         "icon": "bar-chart-3",
-        "entry": "src/panel.tsx",
-        "ui": "components"
+        "entry": "panel/index.html"
       }
     ],
     "statusBarItems": [
@@ -33,7 +57,7 @@
         "text": "Token Tracker",
         "icon": "gauge",
         "tone": "neutral",
-        "tooltip": "계정별 % 대비 모델별 사용량 및 달러 환산 가치($/1%) 감시 (클릭하여 새로고침)",
+        "tooltip": "계정별 쿼터 % 대비 모델별 API 환산 가치($/월 · $/1%) 감시 (클릭하여 새로고침)",
         "command": "refresh"
       }
     ],
@@ -52,7 +76,7 @@
       {
         "key": "pollIntervalSec",
         "title": "Polling interval (seconds)",
-        "description": "How often to sample account rate limits and session usage.",
+        "description": "How often to sample account rate limits and incremental local usage logs.",
         "type": "integer",
         "default": 60,
         "minimum": 15,
@@ -69,8 +93,8 @@
       },
       {
         "key": "nerfAlertDropPercent",
-        "title": "Enshittification alert threshold (% drop)",
-        "description": "Flag a warning when weekly/monthly $/1% value drops by at least this percentage compared to the baseline period.",
+        "title": "Value drop alert threshold (%)",
+        "description": "Flag a warning when weekly/monthly estimated $/mo value drops by at least this percentage compared to your baseline period.",
         "type": "integer",
         "default": 15,
         "minimum": 5,

@@ -5,7 +5,11 @@ import {
   scanAntigravityLocalDeltas,
   type AntigravityDeltaScanResult
 } from './antigravity-logs'
-import { scanClaudeLocalDeltas, type ClaudeDeltaScanResult } from './claude-logs'
+import {
+  scanClaudeLocalDeltas,
+  type ClaudeDeltaScanResult,
+  type MessageUsageWatermark
+} from './claude-logs'
 import {
   applySnapshot,
   buildDashboardView,
@@ -40,14 +44,16 @@ export type LocalClaudeDeltaFetcher = (
   prevOffsets: Record<string, number>,
   isBaseline: boolean,
   lastPollAt: number | null,
-  overrides?: CustomPricingOverrides
+  overrides?: CustomPricingOverrides,
+  prevMessageUsage?: Record<string, MessageUsageWatermark>
 ) => ClaudeDeltaScanResult
 
 export type LocalAntigravityDeltaFetcher = (
   prevOffsets: Record<string, number>,
   isBaseline: boolean,
   lastPollAt: number | null,
-  overrides?: CustomPricingOverrides
+  overrides?: CustomPricingOverrides,
+  prevSeenSteps?: string[]
 ) => AntigravityDeltaScanResult
 
 let customFetcher: AccountListFetcher | null = null
@@ -150,11 +156,14 @@ async function collectUsageData(
   directProviderDeltas: Record<string, Record<string, ModelTokenUsage>>
   nextClaudeOffsets: Record<string, number>
   nextAntigravityOffsets: Record<string, number>
+  nextClaudeMessageUsage: Record<string, MessageUsageWatermark>
+  nextAntigravitySteps: string[]
 }> {
   const isBaseline = prevState.lastPollAt === null
 
   let claudeDelta: ClaudeDeltaScanResult = {
     nextOffsets: prevState.claudeFileOffsets,
+    nextMessageUsage: prevState.recentClaudeMessageUsage,
     deltaModels: {},
     deltaTokens: 0,
     deltaCostUsd: 0,
@@ -166,13 +175,15 @@ async function collectUsageData(
           prevState.claudeFileOffsets,
           isBaseline,
           prevState.lastPollAt,
-          customPricing
+          customPricing,
+          prevState.recentClaudeMessageUsage
         )
       : scanClaudeLocalDeltas(
           prevState.claudeFileOffsets,
           isBaseline,
           prevState.lastPollAt,
-          customPricing
+          customPricing,
+          { prevMessageUsage: prevState.recentClaudeMessageUsage }
         )
   } catch (err) {
     orca.log(`scanClaudeLocalDeltas failed: ${String(err)}`)
@@ -180,6 +191,7 @@ async function collectUsageData(
 
   let agDelta: AntigravityDeltaScanResult = {
     nextOffsets: prevState.antigravityFileOffsets,
+    nextSeenSteps: prevState.recentAntigravitySteps,
     deltaModels: {},
     deltaTokens: 0,
     deltaCostUsd: 0,
@@ -191,13 +203,15 @@ async function collectUsageData(
           prevState.antigravityFileOffsets,
           isBaseline,
           prevState.lastPollAt,
-          customPricing
+          customPricing,
+          prevState.recentAntigravitySteps
         )
       : scanAntigravityLocalDeltas(
           prevState.antigravityFileOffsets,
           isBaseline,
           prevState.lastPollAt,
-          customPricing
+          customPricing,
+          { prevSeenSteps: prevState.recentAntigravitySteps }
         )
   } catch (err) {
     orca.log(`scanAntigravityLocalDeltas failed: ${String(err)}`)
@@ -237,7 +251,9 @@ async function collectUsageData(
     sessions,
     directProviderDeltas,
     nextClaudeOffsets: claudeDelta.nextOffsets,
-    nextAntigravityOffsets: agDelta.nextOffsets
+    nextAntigravityOffsets: agDelta.nextOffsets,
+    nextClaudeMessageUsage: claudeDelta.nextMessageUsage ?? prevState.recentClaudeMessageUsage,
+    nextAntigravitySteps: agDelta.nextSeenSteps ?? prevState.recentAntigravitySteps
   }
 }
 
@@ -260,10 +276,12 @@ async function runRefresh(orca: OrcaWorkerApi): Promise<DashboardView> {
         maxLedgerEntries,
         usageData.directProviderDeltas,
         usageData.nextClaudeOffsets,
-        usageData.nextAntigravityOffsets
+        usageData.nextAntigravityOffsets,
+        usageData.nextClaudeMessageUsage,
+        usageData.nextAntigravitySteps
       )
       await orca.storage.set(STATE_KEY, toPlainJson(next))
-      const view = buildDashboardView(next, nerfAlertDropPercent)
+      const view = buildDashboardView(next, nerfAlertDropPercent, now)
       await updateStatusBar(orca, view)
       orca.panels.post('tracker.updated', toPlainJson(view))
       return view
@@ -272,7 +290,7 @@ async function runRefresh(orca: OrcaWorkerApi): Promise<DashboardView> {
       orca.log(`snapshot failed: ${message}`)
       const errored: TrackerState = { ...prev, lastError: message }
       await orca.storage.set(STATE_KEY, toPlainJson(errored))
-      const view = buildDashboardView(errored, nerfAlertDropPercent)
+      const view = buildDashboardView(errored, nerfAlertDropPercent, now)
       orca.panels.post('tracker.updated', toPlainJson(view))
       return view
     } finally {
@@ -300,21 +318,21 @@ export default function activate(orca: OrcaWorkerApi): void {
       loadState(orca),
       readSettings(orca)
     ])
-    return buildDashboardView(state, nerfAlertDropPercent) as unknown as Record<string, never>
+    return toPlainJson(buildDashboardView(state, nerfAlertDropPercent))
   })
 
   orca.panels.handle('tracker.refresh', async () => {
-    return (await runRefresh(orca)) as unknown as Record<string, never>
+    return toPlainJson(await runRefresh(orca))
   })
 
   orca.panels.handle('tracker.reset', async () => {
     const empty = createEmptyState()
     const { nerfAlertDropPercent } = await readSettings(orca)
-    await orca.storage.set(STATE_KEY, empty as unknown as Record<string, never>)
+    await orca.storage.set(STATE_KEY, toPlainJson(empty))
     const view = buildDashboardView(empty, nerfAlertDropPercent)
     await updateStatusBar(orca, view)
-    orca.panels.post('tracker.updated', view as unknown as Record<string, never>)
-    return view as unknown as Record<string, never>
+    orca.panels.post('tracker.updated', toPlainJson(view))
+    return toPlainJson(view)
   })
 
   orca.panels.handle('tracker.exportCsv', async () => {
@@ -372,7 +390,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       ])
       const view = buildDashboardView(state, nerfAlertDropPercent)
       await updateStatusBar(orca, view)
-      orca.panels.post('tracker.updated', view as unknown as Record<string, never>)
+      orca.panels.post('tracker.updated', toPlainJson(view))
     }
   })
 

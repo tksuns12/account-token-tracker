@@ -222,5 +222,18 @@ export function formatUsd(usd: number | null | undefined): string {
   if (abs === 0) return '$0.00'
   if (abs < 0.01) return `$${usd.toFixed(4)}`
   if (abs < 100) return `$${usd.toFixed(2)}`
-  return `$${usd.toFixed(0)}`
+  const sign = usd < 0 ? '-' : ''
+  return `${sign}$${Math.round(abs).toLocaleString('en-US')}`
+}
+
+export function formatUsdCompact(usd: number | null | undefined): string {
+  if (usd === null || usd === undefined || !Number.isFinite(usd)) return '-'
+  const abs = Math.abs(usd)
+  const sign = usd < 0 ? '-' : ''
+  if (abs === 0) return '$0'
+  if (abs >= 10_000) return `${sign}$${(abs / 1_000).toFixed(1)}K`
+  if (abs >= 100) return `${sign}$${Math.round(abs).toLocaleString('en-US')}`
+  if (abs >= 10) return `${sign}$${abs.toFixed(1)}`
+  if (abs >= 0.01) return `${sign}$${abs.toFixed(2)}`
+  return `${sign}$${abs.toFixed(4)}`
 }

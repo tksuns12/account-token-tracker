@@ -11,24 +11,55 @@ import {
 
 export interface AntigravityDeltaScanResult {
   nextOffsets: Record<string, number>
+  nextSeenSteps: string[]
   deltaModels: Record<string, ModelTokenUsage>
   deltaTokens: number
   deltaCostUsd: number
   hasLocalLogs: boolean
 }
 
+const MAX_SEEN_STEPS = 250
+
 function asNonNegInt(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0
 }
 
+function parseTimestampMs(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v === 'string' && v.length > 0) {
+    const ms = Date.parse(v)
+    return Number.isFinite(ms) ? ms : null
+  }
+  return null
+}
+
+function pruneSeenSteps(list: string[]): string[] {
+  if (list.length <= MAX_SEEN_STEPS) return list
+  return list.slice(list.length - MAX_SEEN_STEPS)
+}
+
+export interface AntigravityParseOptions {
+  sinceMs?: number | null
+  fileKey?: string
+  seenSteps?: Set<string>
+}
+
 /**
  * Parses an Antigravity CLI `transcript.jsonl` chunk into per-model token totals and USD cost.
- * Deduplicates by `step_index` when present.
+ * Deduplicates by `step_index` both within a chunk and across polls when `seenSteps` is provided.
  */
 export function parseAntigravityTranscriptContent(
   content: string,
-  overrides?: CustomPricingOverrides
+  overrides?: CustomPricingOverrides,
+  options?: AntigravityParseOptions
 ): Record<string, ModelTokenUsage> {
+  const sinceMs =
+    typeof options?.sinceMs === 'number' && Number.isFinite(options.sinceMs)
+      ? options.sinceMs
+      : null
+  const seenSteps = options?.seenSteps
+  const filePrefix = options?.fileKey ? `${options.fileKey}#` : ''
+
   const byStep = new Map<
     string,
     {
@@ -51,11 +82,17 @@ export function parseAntigravityTranscriptContent(
     }
     if (!parsed || typeof parsed !== 'object') continue
     const rec = parsed as {
+      timestamp?: unknown
       step_index?: unknown
       model?: unknown
       input_tokens?: unknown
       output_tokens?: unknown
       cache_read_tokens?: unknown
+    }
+
+    if (sinceMs !== null) {
+      const recMs = parseTimestampMs(rec.timestamp)
+      if (recMs !== null && recMs < sinceMs) continue
     }
 
     const model = typeof rec.model === 'string' ? rec.model.trim() : ''
@@ -66,15 +103,18 @@ export function parseAntigravityTranscriptContent(
     const cacheReadTokens = asNonNegInt(rec.cache_read_tokens)
     if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0) continue
 
-    const key =
-      typeof rec.step_index === 'number' && Number.isFinite(rec.step_index)
-        ? `step-${rec.step_index}`
-        : `anon-${++anonSeq}`
+    const hasStep = typeof rec.step_index === 'number' && Number.isFinite(rec.step_index)
+    const key = hasStep ? `${filePrefix}step-${rec.step_index}` : `anon-${++anonSeq}`
+    if (hasStep && seenSteps?.has(key)) continue
+
     byStep.set(key, { model, inputTokens, outputTokens, cacheReadTokens })
   }
 
   const models: Record<string, ModelTokenUsage> = {}
-  for (const item of byStep.values()) {
+  for (const [key, item] of byStep.entries()) {
+    if (!key.startsWith('anon-') && seenSteps) {
+      seenSteps.add(key)
+    }
     const bucket = (models[item.model] ??= createEmptyModelUsage())
     bucket.inputTokens += item.inputTokens
     bucket.outputTokens += item.outputTokens
@@ -153,24 +193,30 @@ function collectTranscriptFiles(brainDirs: string[]): Array<{ key: string; fileP
 /**
  * Incrementally tails Antigravity CLI `transcript.jsonl` files under
  * `~/.gemini/antigravity-cli/brain/<conv-id>/.system_generated/logs/transcript.jsonl`
- * by byte offset.
+ * by byte offset, guarding against uninitialized-offset historical backfills.
  */
 export function scanAntigravityLocalDeltas(
   prevOffsets: Record<string, number>,
   isBaseline: boolean,
   lastPollAt: number | null,
   overrides?: CustomPricingOverrides,
-  options?: { brainDirs?: string[]; maxReadBytesPerFile?: number }
+  options?: {
+    brainDirs?: string[]
+    maxReadBytesPerFile?: number
+    prevSeenSteps?: string[]
+  }
 ): AntigravityDeltaScanResult {
   const brainDirs = options?.brainDirs ?? [
     path.join(os.homedir(), '.gemini', 'antigravity-cli', 'brain'),
     path.join(os.homedir(), '.gemini', 'antigravity', 'brain')
   ]
+  const seenSteps = new Set<string>(options?.prevSeenSteps ?? [])
 
   const files = collectTranscriptFiles(brainDirs)
   if (files.length === 0) {
     return {
       nextOffsets: {},
+      nextSeenSteps: pruneSeenSteps(Array.from(seenSteps)),
       deltaModels: {},
       deltaTokens: 0,
       deltaCostUsd: 0,
@@ -179,6 +225,7 @@ export function scanAntigravityLocalDeltas(
   }
 
   const maxBytes = options?.maxReadBytesPerFile ?? 8 * 1024 * 1024
+  const effectiveBaseline = isBaseline || Object.keys(prevOffsets).length === 0
   const nextOffsets: Record<string, number> = {}
   let deltaModels: Record<string, ModelTokenUsage> = {}
   const newFileCutoff = (lastPollAt ?? Date.now()) - 60_000
@@ -192,12 +239,14 @@ export function scanAntigravityLocalDeltas(
     }
 
     const prevOffset = prevOffsets[key]
-    if (isBaseline) {
+    if (effectiveBaseline) {
       nextOffsets[key] = stat.size
       continue
     }
 
     let readStart: number | null = null
+    let filterSinceMs: number | null = null
+
     if (typeof prevOffset === 'number') {
       if (stat.size > prevOffset) {
         readStart = prevOffset
@@ -205,18 +254,29 @@ export function scanAntigravityLocalDeltas(
         nextOffsets[key] = stat.size
         continue
       }
-    } else if (stat.mtimeMs >= newFileCutoff) {
-      readStart = 0
     } else {
-      nextOffsets[key] = stat.size
-      continue
+      const birthMs =
+        typeof stat.birthtimeMs === 'number' && stat.birthtimeMs > 0 ? stat.birthtimeMs : null
+      const isTrulyNewFile =
+        birthMs !== null ? birthMs >= newFileCutoff : stat.mtimeMs >= newFileCutoff
+      if (isTrulyNewFile) {
+        readStart = 0
+        filterSinceMs = newFileCutoff
+      } else {
+        nextOffsets[key] = stat.size
+        continue
+      }
     }
 
     try {
       const { text, nextOffset } = readNewLines(filePath, readStart, stat.size, maxBytes)
       nextOffsets[key] = nextOffset
       if (text.length > 0) {
-        const parsed = parseAntigravityTranscriptContent(text, overrides)
+        const parsed = parseAntigravityTranscriptContent(text, overrides, {
+          sinceMs: filterSinceMs,
+          fileKey: key,
+          seenSteps
+        })
         deltaModels = mergeModelUsageMaps(deltaModels, parsed)
       }
     } catch {
@@ -233,6 +293,7 @@ export function scanAntigravityLocalDeltas(
 
   return {
     nextOffsets,
+    nextSeenSteps: pruneSeenSteps(Array.from(seenSteps)),
     deltaModels,
     deltaTokens,
     deltaCostUsd,

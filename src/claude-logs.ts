@@ -9,37 +9,78 @@ import {
   type ModelTokenUsage
 } from './pricing'
 
+export interface MessageUsageWatermark {
+  model: string
+  inputTokens: number
+  outputTokens: number
+  cacheWrite5mTokens: number
+  cacheWrite1hTokens: number
+  cacheReadTokens: number
+}
+
 export interface ClaudeDeltaScanResult {
   nextOffsets: Record<string, number>
+  nextMessageUsage: Record<string, MessageUsageWatermark>
   deltaModels: Record<string, ModelTokenUsage>
   deltaTokens: number
   deltaCostUsd: number
   hasLocalLogs: boolean
 }
 
+const MAX_RECENT_MESSAGES = 250
+
 function asNonNegInt(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0
 }
 
+function parseIsoMs(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v
+  if (typeof v === 'string' && v.length > 0) {
+    const ms = Date.parse(v)
+    return Number.isFinite(ms) ? ms : null
+  }
+  return null
+}
+
+function pruneWatermarkMap(
+  map: Record<string, MessageUsageWatermark>
+): Record<string, MessageUsageWatermark> {
+  const keys = Object.keys(map)
+  if (keys.length <= MAX_RECENT_MESSAGES) return map
+  const keep = keys.slice(keys.length - MAX_RECENT_MESSAGES)
+  const out: Record<string, MessageUsageWatermark> = {}
+  for (const k of keep) {
+    out[k] = map[k]
+  }
+  return out
+}
+
+export interface ClaudeParseOptions {
+  /** Skip records whose ISO timestamp is strictly older than this epoch ms. */
+  sinceMs?: number | null
+  /** Previously counted per-message watermarks to prevent cross-poll streaming double counts. */
+  prevMessageUsage?: Record<string, MessageUsageWatermark>
+}
+
 /**
- * Parses a Claude Code session JSONL chunk into per-model token totals.
- * Deduplicates multi-block assistant messages by `message.id` (taking the latest block).
+ * Parses a Claude Code session JSONL chunk into per-model token deltas,
+ * deduplicating both within the chunk and across polls via `message.id` watermarks.
  */
-export function parseClaudeJsonlContent(
+export function parseClaudeJsonlIncremental(
   content: string,
-  overrides?: CustomPricingOverrides
-): Record<string, ModelTokenUsage> {
-  const byMessageId = new Map<
-    string,
-    {
-      model: string
-      inputTokens: number
-      outputTokens: number
-      cacheWrite5mTokens: number
-      cacheWrite1hTokens: number
-      cacheReadTokens: number
-    }
-  >()
+  overrides?: CustomPricingOverrides,
+  options?: ClaudeParseOptions
+): {
+  models: Record<string, ModelTokenUsage>
+  nextMessageUsage: Record<string, MessageUsageWatermark>
+} {
+  const prevWatermarks = options?.prevMessageUsage ?? {}
+  const nextWatermarks: Record<string, MessageUsageWatermark> = { ...prevWatermarks }
+  const sinceMs = typeof options?.sinceMs === 'number' && Number.isFinite(options.sinceMs)
+    ? options.sinceMs
+    : null
+
+  const byMessageId = new Map<string, MessageUsageWatermark>()
 
   let anonSeq = 0
   const lines = content.split('\n')
@@ -53,6 +94,7 @@ export function parseClaudeJsonlContent(
     }
     if (!parsed || typeof parsed !== 'object') continue
     const rec = parsed as {
+      timestamp?: unknown
       message?: {
         id?: unknown
         model?: unknown
@@ -68,6 +110,12 @@ export function parseClaudeJsonlContent(
         }
       }
     }
+
+    if (sinceMs !== null) {
+      const recMs = parseIsoMs(rec.timestamp)
+      if (recMs !== null && recMs < sinceMs) continue
+    }
+
     const msg = rec.message
     const usage = msg?.usage
     const model = typeof msg?.model === 'string' ? msg.model.trim() : ''
@@ -85,37 +133,71 @@ export function parseClaudeJsonlContent(
     }
 
     const key = typeof msg?.id === 'string' && msg.id.length > 0 ? msg.id : `anon-${++anonSeq}`
+    const prevInChunk = byMessageId.get(key)
     byMessageId.set(key, {
       model,
-      inputTokens,
-      outputTokens,
-      cacheWrite5mTokens,
-      cacheWrite1hTokens,
-      cacheReadTokens
+      inputTokens: Math.max(prevInChunk?.inputTokens ?? 0, inputTokens),
+      outputTokens: Math.max(prevInChunk?.outputTokens ?? 0, outputTokens),
+      cacheWrite5mTokens: Math.max(prevInChunk?.cacheWrite5mTokens ?? 0, cacheWrite5mTokens),
+      cacheWrite1hTokens: Math.max(prevInChunk?.cacheWrite1hTokens ?? 0, cacheWrite1hTokens),
+      cacheReadTokens: Math.max(prevInChunk?.cacheReadTokens ?? 0, cacheReadTokens)
     })
   }
 
   const models: Record<string, ModelTokenUsage> = {}
-  for (const item of byMessageId.values()) {
+  for (const [key, item] of byMessageId.entries()) {
+    const isAnon = key.startsWith('anon-')
+    const prev = isAnon ? undefined : prevWatermarks[key]
+
+    const dIn = Math.max(0, item.inputTokens - (prev?.inputTokens ?? 0))
+    const dOut = Math.max(0, item.outputTokens - (prev?.outputTokens ?? 0))
+    const dCw5 = Math.max(0, item.cacheWrite5mTokens - (prev?.cacheWrite5mTokens ?? 0))
+    const dCw1 = Math.max(0, item.cacheWrite1hTokens - (prev?.cacheWrite1hTokens ?? 0))
+    const dCr = Math.max(0, item.cacheReadTokens - (prev?.cacheReadTokens ?? 0))
+
+    if (!isAnon) {
+      nextWatermarks[key] = {
+        model: item.model,
+        inputTokens: Math.max(prev?.inputTokens ?? 0, item.inputTokens),
+        outputTokens: Math.max(prev?.outputTokens ?? 0, item.outputTokens),
+        cacheWrite5mTokens: Math.max(prev?.cacheWrite5mTokens ?? 0, item.cacheWrite5mTokens),
+        cacheWrite1hTokens: Math.max(prev?.cacheWrite1hTokens ?? 0, item.cacheWrite1hTokens),
+        cacheReadTokens: Math.max(prev?.cacheReadTokens ?? 0, item.cacheReadTokens)
+      }
+    }
+
+    const dTotal = dIn + dOut + dCw5 + dCw1 + dCr
+    if (dTotal <= 0) continue
+
     const bucket = (models[item.model] ??= createEmptyModelUsage())
-    bucket.inputTokens += item.inputTokens
-    bucket.outputTokens += item.outputTokens
-    bucket.cacheWrite5mTokens += item.cacheWrite5mTokens
-    bucket.cacheWrite1hTokens += item.cacheWrite1hTokens
-    bucket.cacheReadTokens += item.cacheReadTokens
-    bucket.totalTokens +=
-      item.inputTokens +
-      item.outputTokens +
-      item.cacheWrite5mTokens +
-      item.cacheWrite1hTokens +
-      item.cacheReadTokens
+    bucket.inputTokens += dIn
+    bucket.outputTokens += dOut
+    bucket.cacheWrite5mTokens += dCw5
+    bucket.cacheWrite1hTokens += dCw1
+    bucket.cacheReadTokens += dCr
+    bucket.totalTokens += dTotal
   }
 
   for (const [model, bucket] of Object.entries(models)) {
     bucket.costUsd = computeUsageCostUsd(model, bucket, overrides)
   }
 
-  return models
+  return {
+    models,
+    nextMessageUsage: pruneWatermarkMap(nextWatermarks)
+  }
+}
+
+/**
+ * Parses a Claude Code session JSONL chunk into per-model token totals.
+ * Deduplicates multi-block assistant messages by `message.id` (taking the latest block).
+ */
+export function parseClaudeJsonlContent(
+  content: string,
+  overrides?: CustomPricingOverrides,
+  options?: ClaudeParseOptions
+): Record<string, ModelTokenUsage> {
+  return parseClaudeJsonlIncremental(content, overrides, options).models
 }
 
 function collectJsonlFiles(dir: string, out: string[], maxDepth: number): void {
@@ -173,20 +255,28 @@ function readNewLines(
 
 /**
  * Incrementally tails `~/.claude/projects` JSONL files by byte offset.
- * On baseline (`isBaseline: true`), records file sizes with ZERO bytes read (<5ms even on multi-GB logs).
- * On subsequent polls, reads only newly appended bytes since the previous offset.
+ * On baseline (`isBaseline: true` or empty `prevOffsets`), records file sizes with ZERO bytes read.
+ * On subsequent polls, reads only newly appended bytes since the previous offset and deduplicates
+ * streaming blocks across polls using `message.id` watermarks.
  */
 export function scanClaudeLocalDeltas(
   prevOffsets: Record<string, number>,
   isBaseline: boolean,
   lastPollAt: number | null,
   overrides?: CustomPricingOverrides,
-  options?: { projectsDir?: string; maxReadBytesPerFile?: number }
+  options?: {
+    projectsDir?: string
+    maxReadBytesPerFile?: number
+    prevMessageUsage?: Record<string, MessageUsageWatermark>
+  }
 ): ClaudeDeltaScanResult {
   const projectsDir = options?.projectsDir ?? path.join(os.homedir(), '.claude', 'projects')
+  const prevMessageUsage = options?.prevMessageUsage ?? {}
+
   if (!fs.existsSync(projectsDir)) {
     return {
       nextOffsets: {},
+      nextMessageUsage: prevMessageUsage,
       deltaModels: {},
       deltaTokens: 0,
       deltaCostUsd: 0,
@@ -198,7 +288,10 @@ export function scanClaudeLocalDeltas(
   const files: string[] = []
   collectJsonlFiles(projectsDir, files, 3)
 
+  // Guard against historical backfill when upgrading from a state with no recorded file offsets.
+  const effectiveBaseline = isBaseline || Object.keys(prevOffsets).length === 0
   const nextOffsets: Record<string, number> = {}
+  let currentMessageUsage: Record<string, MessageUsageWatermark> = { ...prevMessageUsage }
   let deltaModels: Record<string, ModelTokenUsage> = {}
   const newFileCutoff = (lastPollAt ?? Date.now()) - 60_000
 
@@ -213,13 +306,14 @@ export function scanClaudeLocalDeltas(
     const relKey = path.relative(projectsDir, filePath)
     const prevOffset = prevOffsets[relKey]
 
-    if (isBaseline) {
-      // Baseline: record current EOF without reading any historical bytes
+    if (effectiveBaseline) {
       nextOffsets[relKey] = stat.size
       continue
     }
 
     let readStart: number | null = null
+    let filterSinceMs: number | null = null
+
     if (typeof prevOffset === 'number') {
       if (stat.size > prevOffset) {
         readStart = prevOffset
@@ -227,21 +321,32 @@ export function scanClaudeLocalDeltas(
         nextOffsets[relKey] = stat.size
         continue
       }
-    } else if (stat.mtimeMs >= newFileCutoff) {
-      // Brand new session file created since last poll
-      readStart = 0
     } else {
-      // Pre-existing file not in offsets (e.g. upgraded from v2): start from EOF
-      nextOffsets[relKey] = stat.size
-      continue
+      const birthMs =
+        typeof stat.birthtimeMs === 'number' && stat.birthtimeMs > 0 ? stat.birthtimeMs : null
+      const isTrulyNewFile =
+        birthMs !== null ? birthMs >= newFileCutoff : stat.mtimeMs >= newFileCutoff
+
+      if (isTrulyNewFile) {
+        readStart = 0
+        filterSinceMs = newFileCutoff
+      } else {
+        // Pre-existing/resumed session not yet in offsets: start from EOF to avoid historical backfill
+        nextOffsets[relKey] = stat.size
+        continue
+      }
     }
 
     try {
       const { text, nextOffset } = readNewLines(filePath, readStart, stat.size, maxBytes)
       nextOffsets[relKey] = nextOffset
       if (text.length > 0) {
-        const parsed = parseClaudeJsonlContent(text, overrides)
-        deltaModels = mergeModelUsageMaps(deltaModels, parsed)
+        const res = parseClaudeJsonlIncremental(text, overrides, {
+          sinceMs: filterSinceMs,
+          prevMessageUsage: currentMessageUsage
+        })
+        currentMessageUsage = res.nextMessageUsage
+        deltaModels = mergeModelUsageMaps(deltaModels, res.models)
       }
     } catch {
       nextOffsets[relKey] = prevOffset ?? stat.size
@@ -257,6 +362,7 @@ export function scanClaudeLocalDeltas(
 
   return {
     nextOffsets,
+    nextMessageUsage: pruneWatermarkMap(currentMessageUsage),
     deltaModels,
     deltaTokens,
     deltaCostUsd,

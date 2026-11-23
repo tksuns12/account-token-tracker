@@ -1,9 +1,20 @@
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
-import { parseAntigravityTranscriptContent } from './antigravity-logs'
-import { parseClaudeJsonlContent } from './claude-logs'
+import {
+  parseAntigravityTranscriptContent,
+  scanAntigravityLocalDeltas
+} from './antigravity-logs'
+import {
+  parseClaudeJsonlContent,
+  parseClaudeJsonlIncremental,
+  scanClaudeLocalDeltas
+} from './claude-logs'
 import {
   applySnapshot,
   buildDashboardView,
+  classifyLedgerEntries,
   createEmptyState,
   filterModelsForWindow,
   getIsoWeekKey,
@@ -12,7 +23,7 @@ import {
   parseAccountListResponse,
   type QuotaWindowSample
 } from './model'
-import { computeUsageCostUsd } from './pricing'
+import { computeUsageCostUsd, formatUsd, formatUsdCompact } from './pricing'
 import * as main from './worker'
 
 test('parses Claude JSONL deduplicating multi-block messages and computes model USD', () => {
@@ -70,10 +81,105 @@ test('parses Claude JSONL deduplicating multi-block messages and computes model 
   assert.equal(Object.keys(models).length, 2)
   assert.equal(models['claude-opus-5-5'].outputTokens, 2000)
   // Opus 5.5: $5 in, $25 out, $10 cache1h, $0.50 cacheRead
-  // (1000*5 + 2000*25 + 10000*10 + 50000*0.5) / 1e6 = (5000 + 50000 + 100000 + 25000)/1e6 = $0.18
   assert.equal(Number(models['claude-opus-5-5'].costUsd.toFixed(4)), 0.18)
-  // Sonnet 5.5: $3 in, $15 out => (10000*3 + 10000*15)/1e6 = $0.18
   assert.equal(Number(models['claude-sonnet-5-5'].costUsd.toFixed(4)), 0.18)
+})
+
+test('Claude incremental parser filters old timestamps and diffs cross-poll streaming blocks', () => {
+  const now = Date.UTC(2026, 10, 23, 6, 0, 0)
+  const chunk1 = [
+    // Historical record older than sinceMs must be skipped
+    JSON.stringify({
+      timestamp: new Date(now - 3_600_000).toISOString(),
+      message: {
+        id: 'msg_old',
+        model: 'claude-sonnet-5-5',
+        usage: { input_tokens: 1_000_000, output_tokens: 500_000 }
+      }
+    }),
+    // Streaming block 1 of msg_stream
+    JSON.stringify({
+      timestamp: new Date(now).toISOString(),
+      message: {
+        id: 'msg_stream',
+        model: 'claude-opus-5-5',
+        usage: { input_tokens: 1000, output_tokens: 200 }
+      }
+    })
+  ].join('\n')
+
+  const res1 = parseClaudeJsonlIncremental(chunk1, undefined, { sinceMs: now - 60_000 })
+  assert.equal(res1.models['claude-sonnet-5-5'], undefined)
+  assert.equal(res1.models['claude-opus-5-5'].outputTokens, 200)
+  assert.equal(res1.models['claude-opus-5-5'].inputTokens, 1000)
+
+  // Streaming block 2 of same msg_stream arrives in next poll with cumulative usage
+  const chunk2 = JSON.stringify({
+    timestamp: new Date(now + 5_000).toISOString(),
+    message: {
+      id: 'msg_stream',
+      model: 'claude-opus-5-5',
+      usage: { input_tokens: 1000, output_tokens: 700 }
+    }
+  })
+  const res2 = parseClaudeJsonlIncremental(chunk2, undefined, {
+    prevMessageUsage: res1.nextMessageUsage
+  })
+  // Only the +500 output token increment is counted, NOT 1000 input + 700 output again
+  assert.equal(res2.models['claude-opus-5-5'].inputTokens, 0)
+  assert.equal(res2.models['claude-opus-5-5'].outputTokens, 500)
+})
+
+test('scanners treat empty prevOffsets as baseline to prevent historical backfill spikes', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'att-scan-'))
+  try {
+    const claudeProj = path.join(tmpRoot, 'claude-proj')
+    fs.mkdirSync(claudeProj, { recursive: true })
+    const claudeFile = path.join(claudeProj, 'sess.jsonl')
+    fs.writeFileSync(
+      claudeFile,
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        message: {
+          id: 'msg_huge',
+          model: 'claude-sonnet-5-5',
+          usage: { input_tokens: 0, output_tokens: 5_000_000 }
+        }
+      }) + '\n'
+    )
+
+    // Even when isBaseline=false (e.g. upgraded from older state), empty prevOffsets must NOT ingest history
+    const claudeRes = scanClaudeLocalDeltas({}, false, Date.now() - 10_000, undefined, {
+      projectsDir: tmpRoot
+    })
+    assert.equal(claudeRes.deltaTokens, 0)
+    assert.equal(claudeRes.deltaCostUsd, 0)
+    assert.ok(claudeRes.nextOffsets['claude-proj/sess.jsonl'] > 0)
+
+    // Same for Antigravity scanner
+    const agBrain = path.join(tmpRoot, 'antigravity-cli', 'brain')
+    const agLogs = path.join(agBrain, 'conv-1', '.system_generated', 'logs')
+    fs.mkdirSync(agLogs, { recursive: true })
+    fs.writeFileSync(
+      path.join(agLogs, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 1,
+        model: 'gemini-4-neon-high',
+        input_tokens: 1_000_000,
+        output_tokens: 500_000,
+        cache_read_tokens: 0
+      }) + '\n'
+    )
+
+    const agRes = scanAntigravityLocalDeltas({}, false, Date.now() - 10_000, undefined, {
+      brainDirs: [agBrain]
+    })
+    assert.equal(agRes.deltaTokens, 0)
+    assert.equal(agRes.deltaCostUsd, 0)
+    assert.ok(Object.keys(agRes.nextOffsets).length === 1)
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
 })
 
 test('parses Antigravity transcript.jsonl and routes models to matching quota buckets', () => {
@@ -94,10 +200,21 @@ test('parses Antigravity transcript.jsonl and routes models to matching quota bu
     })
   ].join('\n')
 
-  const models = parseAntigravityTranscriptContent(transcript)
+  const seen = new Set<string>()
+  const models = parseAntigravityTranscriptContent(transcript, undefined, {
+    fileKey: 'conv-1',
+    seenSteps: seen
+  })
   assert.equal(Object.keys(models).length, 2)
   assert.equal(models['gemini-4-neon-medium'].totalTokens, 310_000)
   assert.ok(models['gemini-4-neon-medium'].costUsd > 0)
+
+  // Re-reading same chunk with seenSteps yields 0 duplicates
+  const dupModels = parseAntigravityTranscriptContent(transcript, undefined, {
+    fileKey: 'conv-1',
+    seenSteps: seen
+  })
+  assert.equal(Object.keys(dupModels).length, 0)
 
   const geminiOnly = filterModelsForWindow(
     'antigravity',
@@ -114,9 +231,12 @@ test('parses Antigravity transcript.jsonl and routes models to matching quota bu
     models
   )
   assert.deepEqual(Object.keys(claudeGptOnly), ['claude-opus-5-5'])
+
+  const fableOnly = filterModelsForWindow('claude', 'fableWeekly', 'Fable Weekly (7d)', models)
+  assert.deepEqual(Object.keys(fableOnly), [])
 })
 
-test('parses orca account list --json output across providers and buckets', () => {
+test('parses orca account list --json output across providers, buckets, and fableWeekly', () => {
   const sample = {
     ok: true,
     result: {
@@ -131,6 +251,12 @@ test('parses orca account list --json output across providers and buckets', () =
             usedPercent: 20,
             windowMinutes: 10080,
             resetsAt: 1795694400308,
+            resetDescription: 'Thu 9:00 PM'
+          },
+          fableWeekly: {
+            usedPercent: 0,
+            windowMinutes: 10080,
+            resetsAt: 1795694400000,
             resetDescription: 'Thu 9:00 PM'
           },
           usageMetadata: { authProvenance: 'system' }
@@ -152,9 +278,179 @@ test('parses orca account list --json output across providers and buckets', () =
   }
 
   const parsed = parseAccountListResponse(sample)
-  assert.equal(parsed.length, 2)
-  assert.equal(parsed[0].provider, 'claude')
-  assert.equal(parsed[1].provider, 'antigravity')
+  assert.equal(parsed.length, 3)
+  assert.equal(parsed[0].windowId, 'weekly')
+  assert.equal(parsed[1].windowId, 'fableWeekly')
+  assert.equal(parsed[2].provider, 'antigravity')
+})
+
+test('excludes legacy $0 periods and >$100/1% spike outliers from trends while preserving raw ledger', () => {
+  const week1 = Date.UTC(2026, 10, 9, 12, 0, 0) // 2026-W46
+  const week2 = Date.UTC(2026, 10, 16, 12, 0, 0) // 2026-W47
+  const week3 = Date.UTC(2026, 10, 23, 12, 0, 0) // 2026-W48
+
+  const state = createEmptyState()
+  state.lastPollAt = week3
+  state.windows['claude::acc-1::weekly'] = {
+    key: 'claude::acc-1::weekly',
+    provider: 'claude',
+    accountId: 'acc-1',
+    accountLabel: 'Claude (max_20x)',
+    planType: 'max_20x',
+    isActiveAccount: true,
+    windowId: 'weekly',
+    windowLabel: 'Weekly (7d)',
+    windowMinutes: 10080,
+    resetsAt: week3 + 3 * 86_400_000,
+    resetDescription: 'Thu 9:00 PM',
+    baselinePercent: 57,
+    currentPercent: 60,
+    trackedDeltaPercent: 3,
+    trackedTokens: 1_500_000_000,
+    pendingTokens: 0,
+    trackedCostUsd: 655,
+    pendingCostUsd: 0,
+    trackedModels: {},
+    pendingModels: {},
+    firstSeenAt: week3 - 3_600_000,
+    lastUpdatedAt: week3
+  }
+  state.ledger = [
+    // Valid jump in W48: $10 for +1%
+    {
+      id: 'valid-w48',
+      timestamp: week3,
+      provider: 'claude',
+      accountId: 'acc-1',
+      accountLabel: 'Claude (max_20x)',
+      windowId: 'weekly',
+      windowLabel: 'Weekly (7d)',
+      windowMinutes: 10080,
+      fromPercent: 59,
+      toPercent: 60,
+      deltaPercent: 1,
+      deltaTokens: 2_000_000,
+      tokensPerPercent: 2_000_000,
+      deltaCostUsd: 10,
+      usdPerPercent: 10,
+      models: {
+        'claude-opus-5-5': {
+          inputTokens: 100_000,
+          outputTokens: 300_000,
+          cacheWrite5mTokens: 0,
+          cacheWrite1hTokens: 0,
+          cacheReadTokens: 1_600_000,
+          totalTokens: 2_000_000,
+          costUsd: 10
+        }
+      },
+      sessionTitles: []
+    },
+    // Backfill spike outlier in W48: $611 for +1%
+    {
+      id: 'spike-w48',
+      timestamp: week3 - 60_000,
+      provider: 'claude',
+      accountId: 'acc-1',
+      accountLabel: 'Claude (max_20x)',
+      windowId: 'weekly',
+      windowLabel: 'Weekly (7d)',
+      windowMinutes: 10080,
+      fromPercent: 58,
+      toPercent: 59,
+      deltaPercent: 1,
+      deltaTokens: 1_400_000_000,
+      tokensPerPercent: 1_400_000_000,
+      deltaCostUsd: 611,
+      usdPerPercent: 611,
+      models: {},
+      sessionTitles: []
+    },
+    // Legacy $0 entry in W47
+    {
+      id: 'legacy-w47',
+      timestamp: week2,
+      provider: 'claude',
+      accountId: 'acc-1',
+      accountLabel: 'Claude (max_20x)',
+      windowId: 'weekly',
+      windowLabel: 'Weekly (7d)',
+      windowMinutes: 10080,
+      fromPercent: 10,
+      toPercent: 20,
+      deltaPercent: 10,
+      deltaTokens: 50_000_000,
+      tokensPerPercent: 5_000_000,
+      deltaCostUsd: 0,
+      usdPerPercent: 0,
+      models: {},
+      sessionTitles: []
+    }
+  ]
+  state.periodStats = {
+    [`week::${getIsoWeekKey(week2)}::claude::acc-1::weekly`]: {
+      key: `week::${getIsoWeekKey(week2)}::claude::acc-1::weekly`,
+      periodType: 'week',
+      periodKey: getIsoWeekKey(week2),
+      provider: 'claude',
+      accountId: 'acc-1',
+      accountLabel: 'Claude (max_20x)',
+      windowId: 'weekly',
+      windowLabel: 'Weekly (7d)',
+      windowMinutes: 10080,
+      totalDeltaPercent: 10,
+      totalDeltaTokens: 50_000_000,
+      totalDeltaCostUsd: 0,
+      models: {},
+      sampleCount: 1,
+      firstTimestamp: week2,
+      lastTimestamp: week2
+    },
+    [`week::${getIsoWeekKey(week3)}::claude::acc-1::weekly`]: {
+      key: `week::${getIsoWeekKey(week3)}::claude::acc-1::weekly`,
+      periodType: 'week',
+      periodKey: getIsoWeekKey(week3),
+      provider: 'claude',
+      accountId: 'acc-1',
+      accountLabel: 'Claude (max_20x)',
+      windowId: 'weekly',
+      windowLabel: 'Weekly (7d)',
+      windowMinutes: 10080,
+      totalDeltaPercent: 2,
+      totalDeltaTokens: 1_402_000_000,
+      totalDeltaCostUsd: 621,
+      models: {},
+      sampleCount: 2,
+      firstTimestamp: week3 - 60_000,
+      lastTimestamp: week3
+    }
+  }
+
+  const classified = classifyLedgerEntries(state.ledger)
+  assert.equal(classified[0].quality, 'valid')
+  assert.equal(classified[1].quality, 'outlier')
+  assert.equal(classified[2].quality, 'zero_cost')
+
+  const view = buildDashboardView(state, 15, week3)
+  // Raw ledger is preserved
+  assert.equal(view.ledger.length, 3)
+  assert.equal(view.ledgerViews.length, 3)
+  // Series picks W48 as clean USD baseline (ignoring legacy $0 W47 and $611 spike)
+  assert.equal(view.weeklySeries.length, 1)
+  assert.equal(view.weeklySeries[0].metricKind, 'usd')
+  assert.equal(view.weeklySeries[0].latestUsdPerPercent, 10)
+  assert.equal(view.weeklySeries[0].excludedOutlierCount, 1)
+  assert.equal(view.weeklySeries[0].excludedZeroCount, 1)
+  // Window view also reflects clean outlier-excluded cost ($10 instead of $655)
+  assert.equal(view.windows[0].trackedCostUsd, 10)
+  assert.equal(view.windows[0].excludedOutlierCount, 1)
+  // Account grouping works
+  assert.equal(view.accounts.length, 1)
+  assert.equal(view.accounts[0].totalTrackedCostUsd, 10)
+  assert.ok(view.accounts[0].windows[0].resetCountdownText?.includes('3일'))
+  assert.equal(formatUsd(7384), '$7,384')
+  assert.equal(formatUsdCompact(12500), '$12.5K')
+  assert.ok(week1 < week2)
 })
 
 test('tracks per-model USD per 1% and detects enshittification drop in $/1%', () => {
@@ -175,7 +471,6 @@ test('tracks per-model USD per 1% and detects enshittification drop in $/1%', ()
   const week1 = Date.UTC(2026, 10, 9, 12, 0, 0) // 2026-W46
   const week2 = Date.UTC(2026, 10, 16, 12, 0, 0) // 2026-W47
 
-  // Baseline poll
   let state = applySnapshot(
     createEmptyState(),
     [baseQuota],
@@ -259,19 +554,18 @@ test('tracks per-model USD per 1% and detects enshittification drop in $/1%', ()
     week2
   )
 
-  const view = buildDashboardView(state, 15)
+  const view = buildDashboardView(state, 15, week2)
   assert.equal(view.weeklySeries.length, 1)
   assert.equal(view.weeklySeries[0].metricKind, 'usd')
   assert.equal(view.weeklySeries[0].baselineUsdPerPercent, 2.0)
   assert.equal(view.weeklySeries[0].latestUsdPerPercent, 1.5)
-  // Weekly (7d): 30/7 cycles per month => $200 * 30/7 ≈ $857.14, $150 * 30/7 ≈ $642.86
   assert.equal(Math.round(view.weeklySeries[0].baselineMonthlyUsd), 857)
   assert.equal(Math.round(view.weeklySeries[0].latestMonthlyUsd), 643)
   assert.equal(Math.round(view.weeklySeries[0].vsBaselinePercent ?? 0), -25)
   assert.equal(view.weeklySeries[0].status, 'degraded')
+  assert.equal(view.weeklySeries[0].points.length, 2)
   assert.equal(view.degradedAlerts.length, 1)
 
-  // Verify week/month keys
   assert.ok(state.periodStats[`week::${getIsoWeekKey(week1 + 60_000)}::claude::acc-1::weekly`])
   assert.ok(state.periodStats[`month::${getMonthKey(week2)}::claude::acc-1::weekly`])
 
@@ -300,12 +594,12 @@ test('tracks per-model USD per 1% and detects enshittification drop in $/1%', ()
       }
     }
   }
-  const filteredView = buildDashboardView(stateWith5h, 15)
+  const filteredView = buildDashboardView(stateWith5h, 15, week2)
   assert.equal(filteredView.weeklySeries.length, 1)
   assert.equal(filteredView.weeklySeries[0].windowId, 'weekly')
 })
 
-test('migrates v1 state cleanly to v3 and custom pricing overrides work', () => {
+test('migrates v1 state cleanly to v4 and custom pricing overrides work', () => {
   const migrated = migrateState({
     version: 1,
     lastPollAt: 1000,
@@ -314,7 +608,9 @@ test('migrates v1 state cleanly to v3 and custom pricing overrides work', () => 
     ledger: [],
     sessionTokens: {}
   })
-  assert.equal(migrated.version, 3)
+  assert.equal(migrated.version, 4)
+  assert.deepEqual(migrated.recentClaudeMessageUsage, {})
+  assert.deepEqual(migrated.recentAntigravitySteps, [])
 
   const customUsd = computeUsageCostUsd(
     'claude-opus-5-5',
@@ -351,6 +647,7 @@ test('worker refreshes using local Claude logs and exports trends CSV with USD',
     if (isBaseline) {
       return {
         nextOffsets: { 'proj/s1.jsonl': 1000 },
+        nextMessageUsage: {},
         deltaModels: {},
         deltaTokens: 0,
         deltaCostUsd: 0,
@@ -359,6 +656,7 @@ test('worker refreshes using local Claude logs and exports trends CSV with USD',
     }
     return {
       nextOffsets: { 'proj/s1.jsonl': 2500 },
+      nextMessageUsage: {},
       deltaModels: {
         'claude-opus-5-5': {
           inputTokens: 0,
@@ -406,11 +704,13 @@ test('worker refreshes using local Claude logs and exports trends CSV with USD',
     const view = (await worker.request('tracker.refresh')) as unknown as {
       windows: Array<{ usdPerPercent: number; estimated100PercentUsd: number }>
       weeklyRows: Array<{ usdPerPercent: number }>
+      accounts: Array<{ accountLabel: string }>
     }
 
     assert.equal(view.windows[0].usdPerPercent, 1.5)
     assert.equal(view.windows[0].estimated100PercentUsd, 150)
     assert.equal(view.weeklyRows[0].usdPerPercent, 1.5)
+    assert.equal(view.accounts[0].accountLabel, 'alice@example.com')
 
     const csvRes = (await worker.request('tracker.exportTrendsCsv', {
       granularity: 'week'

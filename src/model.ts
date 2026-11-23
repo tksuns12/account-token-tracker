@@ -1,16 +1,23 @@
+import type { MessageUsageWatermark } from './claude-logs'
 import {
   addModelUsage,
   createEmptyModelUsage,
   estimateBlendedCostUsd,
   formatUsd,
+  formatUsdCompact,
   mergeModelUsageMaps,
   shortenModelName,
   type ModelTokenUsage
 } from './pricing'
 
+/** Hard upper bound on plausible API USD value per 1% quota jump (~$10k/cycle, ~$42.8k/mo). */
+export const MAX_SANE_USD_PER_PERCENT = 100
+/** Statistical multiplier above window median $/1% to flag as spike outlier. */
+export const OUTLIER_MEDIAN_MULTIPLIER = 5
+
 /**
- * Filters Antigravity model deltas to the specific quota bucket they consume
- * (e.g., Gemini Models vs Claude & GPT models vs Gemini 4 Argon).
+ * Filters model deltas to the specific quota bucket they consume
+ * (e.g., Antigravity Gemini vs Claude/GPT vs Argon; Claude fableWeekly).
  */
 export function filterModelsForWindow(
   provider: string,
@@ -18,6 +25,14 @@ export function filterModelsForWindow(
   windowLabel: string,
   models: Record<string, ModelTokenUsage>
 ): Record<string, ModelTokenUsage> {
+  if (provider === 'claude' && windowId === 'fableWeekly') {
+    const out: Record<string, ModelTokenUsage> = {}
+    for (const [model, usage] of Object.entries(models)) {
+      if (/fable/i.test(model)) out[model] = usage
+    }
+    return out
+  }
+
   if (provider !== 'antigravity') return models
   const w = `${windowId} ${windowLabel}`.toLowerCase()
 
@@ -43,7 +58,7 @@ export function filterModelsForWindow(
   return out
 }
 
-export { formatUsd, shortenModelName, type ModelTokenUsage }
+export { formatUsd, formatUsdCompact, shortenModelName, type ModelTokenUsage }
 
 export interface SessionRecord {
   sessionId: string
@@ -115,6 +130,15 @@ export interface LedgerEntry {
   sessionTitles: string[]
 }
 
+export type LedgerQuality = 'valid' | 'zero_cost' | 'outlier'
+
+export interface LedgerEntryView extends LedgerEntry {
+  quality: LedgerQuality
+  qualityReason: string | null
+  topModelsSummary: string
+  modelBreakdown: ModelBreakdownItem[]
+}
+
 export type PeriodGranularity = 'week' | 'month'
 
 export interface PeriodStat {
@@ -144,7 +168,7 @@ export interface StoredSessionBaseline {
 }
 
 export interface TrackerState {
-  version: 3
+  version: 4
   lastPollAt: number | null
   lastError: string | null
   windows: Record<string, WindowTracker>
@@ -153,6 +177,8 @@ export interface TrackerState {
   sessionTokens: Record<string, StoredSessionBaseline>
   claudeFileOffsets: Record<string, number>
   antigravityFileOffsets: Record<string, number>
+  recentClaudeMessageUsage: Record<string, MessageUsageWatermark>
+  recentAntigravitySteps: string[]
 }
 
 export interface ModelBreakdownItem {
@@ -168,6 +194,9 @@ export interface ModelBreakdownItem {
 }
 
 export interface WindowSummaryView extends WindowTracker {
+  isMonthlyEligible: boolean
+  resetCountdownText: string | null
+  excludedOutlierCount: number
   tokensPerPercent: number | null
   estimated100PercentTokens: number | null
   usdPerPercent: number | null
@@ -176,7 +205,46 @@ export interface WindowSummaryView extends WindowTracker {
   modelBreakdown: ModelBreakdownItem[]
 }
 
+export interface AccountGroupView {
+  key: string
+  provider: string
+  providerName: string
+  accountId: string
+  accountLabel: string
+  planType: string | null
+  isActiveAccount: boolean
+  windows: WindowSummaryView[]
+  totalTrackedCostUsd: number
+  totalTrackedTokens: number
+  primaryMonthlyUsd: number | null
+  excludedOutlierCount: number
+  modelBreakdown: ModelBreakdownItem[]
+}
+
+export interface DashboardSummaryView {
+  totalTrackedCostUsd: number
+  totalTrackedTokens: number
+  activeAccountCount: number
+  totalAccountCount: number
+  alertCount: number
+  primaryMonthlyUsd: number | null
+  primaryLabel: string | null
+  primaryStatus: DriftStatus
+  validLedgerCount: number
+  excludedLedgerCount: number
+}
+
 export type DriftStatus = 'collecting' | 'stable' | 'watch' | 'degraded'
+
+export interface TrendChartPoint {
+  periodKey: string
+  monthlyUsd: number
+  usdPerPercent: number
+  tokensPerPercent: number
+  deltaPercent: number
+  vsBaselinePercent: number | null
+  topModelsSummary: string
+}
 
 export interface TrendPeriodRow {
   key: string
@@ -196,7 +264,11 @@ export interface TrendPeriodRow {
   estimated100PercentUsd: number
   estimatedMonthlyUsd: number
   topModelsSummary: string
+  modelBreakdown: ModelBreakdownItem[]
   sampleCount: number
+  excludedZeroCount: number
+  excludedOutlierCount: number
+  hasValidUsd: boolean
   prevChangePercent: number | null
   baselineChangePercent: number | null
   bar: string
@@ -227,14 +299,20 @@ export interface TrendSeriesSummary {
   vsPreviousPercent: number | null
   metricKind: 'usd' | 'tokens'
   status: DriftStatus
+  excludedZeroCount: number
+  excludedOutlierCount: number
+  points: TrendChartPoint[]
 }
 
 export interface DashboardView {
   lastPollAt: number | null
   lastError: string | null
   nerfAlertDropPercent: number
+  summary: DashboardSummaryView
+  accounts: AccountGroupView[]
   windows: WindowSummaryView[]
   ledger: LedgerEntry[]
+  ledgerViews: LedgerEntryView[]
   weeklySeries: TrendSeriesSummary[]
   weeklyRows: TrendPeriodRow[]
   monthlySeries: TrendSeriesSummary[]
@@ -247,7 +325,7 @@ export interface DashboardView {
 
 export function createEmptyState(): TrackerState {
   return {
-    version: 3,
+    version: 4,
     lastPollAt: null,
     lastError: null,
     windows: {},
@@ -255,7 +333,9 @@ export function createEmptyState(): TrackerState {
     periodStats: {},
     sessionTokens: {},
     claudeFileOffsets: {},
-    antigravityFileOffsets: {}
+    antigravityFileOffsets: {},
+    recentClaudeMessageUsage: {},
+    recentAntigravitySteps: []
   }
 }
 
@@ -319,6 +399,32 @@ export function estimateMonthlyUsd(
   return usdPerPercent * 100 * cyclesPerMonth
 }
 
+/** Formats a human-readable relative countdown to a quota reset timestamp. */
+export function formatResetCountdown(
+  resetsAt: number | null | undefined,
+  resetDescription: string | null | undefined,
+  now = Date.now()
+): string | null {
+  if (typeof resetsAt === 'number' && Number.isFinite(resetsAt) && resetsAt > now) {
+    const diffMin = Math.max(1, Math.round((resetsAt - now) / 60_000))
+    if (diffMin >= 1440) {
+      const days = Math.floor(diffMin / 1440)
+      const hours = Math.floor((diffMin % 1440) / 60)
+      return hours > 0 ? `${days}일 ${hours}시간 후` : `${days}일 후`
+    }
+    if (diffMin >= 60) {
+      const hours = Math.floor(diffMin / 60)
+      const mins = diffMin % 60
+      return mins > 0 ? `${hours}시간 ${mins}분 후` : `${hours}시간 후`
+    }
+    return `${diffMin}분 후`
+  }
+  if (resetDescription && resetDescription.trim().length > 0) {
+    return resetDescription.trim()
+  }
+  return null
+}
+
 function recordPeriodRollup(
   periodStats: Record<string, PeriodStat>,
   entry: LedgerEntry,
@@ -366,13 +472,13 @@ function recordPeriodRollup(
   }
 }
 
-/** Upgrades v1, v2, or partial persisted state to v3 cleanly. */
+/** Upgrades v1, v2, v3, or partial persisted state to v4 cleanly. */
 export function migrateState(raw: unknown): TrackerState {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return createEmptyState()
   }
   const obj = raw as Partial<TrackerState> & { version?: number }
-  if (obj.version !== 1 && obj.version !== 2 && obj.version !== 3) {
+  if (obj.version !== 1 && obj.version !== 2 && obj.version !== 3 && obj.version !== 4) {
     return createEmptyState()
   }
 
@@ -407,7 +513,11 @@ export function migrateState(raw: unknown): TrackerState {
   }
 
   const periodStats: Record<string, PeriodStat> = {}
-  if ((obj.version === 2 || obj.version === 3) && obj.periodStats && typeof obj.periodStats === 'object') {
+  if (
+    (obj.version === 2 || obj.version === 3 || obj.version === 4) &&
+    obj.periodStats &&
+    typeof obj.periodStats === 'object'
+  ) {
     for (const [k, s] of Object.entries(obj.periodStats)) {
       periodStats[k] = {
         ...s,
@@ -425,7 +535,7 @@ export function migrateState(raw: unknown): TrackerState {
   }
 
   return {
-    version: 3,
+    version: 4,
     lastPollAt: typeof obj.lastPollAt === 'number' ? obj.lastPollAt : null,
     lastError: typeof obj.lastError === 'string' ? obj.lastError : null,
     windows,
@@ -440,7 +550,14 @@ export function migrateState(raw: unknown): TrackerState {
     antigravityFileOffsets:
       obj.antigravityFileOffsets && typeof obj.antigravityFileOffsets === 'object'
         ? obj.antigravityFileOffsets
-        : {}
+        : {},
+    recentClaudeMessageUsage:
+      obj.recentClaudeMessageUsage && typeof obj.recentClaudeMessageUsage === 'object'
+        ? obj.recentClaudeMessageUsage
+        : {},
+    recentAntigravitySteps: Array.isArray(obj.recentAntigravitySteps)
+      ? obj.recentAntigravitySteps.filter((x): x is string => typeof x === 'string')
+      : []
   }
 }
 
@@ -709,6 +826,7 @@ export function parseAccountListResponse(rawJson: unknown): QuotaWindowSample[] 
     } else {
       pushWindowIfPresent(samples, base, 'session', '5h Session', rlObj.session)
       pushWindowIfPresent(samples, base, 'weekly', 'Weekly (7d)', rlObj.weekly)
+      pushWindowIfPresent(samples, base, 'fableWeekly', 'Fable Weekly (7d)', rlObj.fableWeekly)
       pushWindowIfPresent(samples, base, 'monthly', 'Monthly', rlObj.monthly)
     }
   }
@@ -747,15 +865,15 @@ export function parseAccountListResponse(rawJson: unknown): QuotaWindowSample[] 
 }
 
 function isQuotaReset(prev: WindowTracker, next: QuotaWindowSample): boolean {
-  if (
-    prev.resetsAt !== null &&
-    next.resetsAt !== null &&
-    Math.abs(next.resetsAt - prev.resetsAt) > 5 * 60 * 1000
-  ) {
-    return true
-  }
   if (next.usedPercent < prev.currentPercent - 2) {
     return true
+  }
+  if (prev.resetsAt !== null && next.resetsAt !== null) {
+    const resetDeltaMs = next.resetsAt - prev.resetsAt
+    // Ignore minor rolling-window jitter (<15m) unless usedPercent actually dropped.
+    if (resetDeltaMs > 15 * 60 * 1000 && next.usedPercent <= prev.currentPercent) {
+      return true
+    }
   }
   return false
 }
@@ -791,7 +909,9 @@ export function applySnapshot(
   maxLedgerEntries = 300,
   directProviderDeltas?: Record<string, Record<string, ModelTokenUsage>>,
   nextClaudeFileOffsets?: Record<string, number>,
-  nextAntigravityFileOffsets?: Record<string, number>
+  nextAntigravityFileOffsets?: Record<string, number>,
+  nextClaudeMessageUsage?: Record<string, MessageUsageWatermark>,
+  nextAntigravitySteps?: string[]
 ): TrackerState {
   const isBaseline = prevState.lastPollAt === null
   const nextSessionTokens: Record<string, StoredSessionBaseline> = { ...prevState.sessionTokens }
@@ -922,7 +1042,9 @@ export function applySnapshot(
       sample.windowLabel,
       rawProviderModels
     )
-    const isFilteredBucket = sample.provider === 'antigravity'
+    const isFilteredBucket =
+      sample.provider === 'antigravity' ||
+      (sample.provider === 'claude' && sample.windowId === 'fableWeekly')
     let providerDeltaTokens = 0
     let providerDeltaCost = 0
     if (isFilteredBucket) {
@@ -1040,7 +1162,7 @@ export function applySnapshot(
   }
 
   return {
-    version: 3,
+    version: 4,
     lastPollAt: now,
     lastError: null,
     windows: nextWindows,
@@ -1048,8 +1170,81 @@ export function applySnapshot(
     periodStats: nextPeriodStats,
     sessionTokens: nextSessionTokens,
     claudeFileOffsets: nextClaudeFileOffsets ?? prevState.claudeFileOffsets,
-    antigravityFileOffsets: nextAntigravityFileOffsets ?? prevState.antigravityFileOffsets
+    antigravityFileOffsets: nextAntigravityFileOffsets ?? prevState.antigravityFileOffsets,
+    recentClaudeMessageUsage: nextClaudeMessageUsage ?? prevState.recentClaudeMessageUsage,
+    recentAntigravitySteps: nextAntigravitySteps ?? prevState.recentAntigravitySteps
   }
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+/**
+ * Classifies every ledger entry as `valid`, `zero_cost` (legacy or external spend),
+ * or `outlier` (historical backfill spike > $100/1% or > 5x series median).
+ * Raw entries are never deleted; trend and summary calculations exclude non-valid entries.
+ */
+export function classifyLedgerEntries(ledger: LedgerEntry[]): LedgerEntryView[] {
+  const saneRatesBySeries = new Map<string, number[]>()
+
+  for (const e of ledger) {
+    if (e.deltaCostUsd <= 0 || e.deltaPercent <= 0) continue
+    const rate = e.usdPerPercent > 0 ? e.usdPerPercent : e.deltaCostUsd / e.deltaPercent
+    if (rate > MAX_SANE_USD_PER_PERCENT) continue
+    const seriesKey = `${e.provider}::${e.accountId}::${e.windowId}`
+    const list = saneRatesBySeries.get(seriesKey) ?? []
+    list.push(rate)
+    saneRatesBySeries.set(seriesKey, list)
+  }
+
+  const medianBySeries = new Map<string, number>()
+  for (const [seriesKey, rates] of saneRatesBySeries.entries()) {
+    if (rates.length >= 4) {
+      medianBySeries.set(seriesKey, median(rates))
+    }
+  }
+
+  return ledger.map((e) => {
+    const rate =
+      e.deltaPercent > 0
+        ? e.usdPerPercent > 0
+          ? e.usdPerPercent
+          : e.deltaCostUsd / e.deltaPercent
+        : 0
+    const seriesKey = `${e.provider}::${e.accountId}::${e.windowId}`
+    const seriesMedian = medianBySeries.get(seriesKey)
+
+    let quality: LedgerQuality = 'valid'
+    let qualityReason: string | null = null
+
+    if (e.deltaCostUsd <= 0) {
+      quality = 'zero_cost'
+      qualityReason =
+        e.deltaTokens > 0 ? '과거 토큰 전용 기록 ($0)' : '로컬 로그 없음 ($0)'
+    } else if (rate > MAX_SANE_USD_PER_PERCENT) {
+      quality = 'outlier'
+      qualityReason = `이상치 (${formatUsd(rate)}/1% > $${MAX_SANE_USD_PER_PERCENT} 상한)`
+    } else if (
+      seriesMedian !== undefined &&
+      seriesMedian > 0 &&
+      rate > seriesMedian * OUTLIER_MEDIAN_MULTIPLIER
+    ) {
+      quality = 'outlier'
+      qualityReason = `이상치 (중앙값 ${formatUsd(seriesMedian)}/1% 대비 ${(rate / seriesMedian).toFixed(1)}배)`
+    }
+
+    return {
+      ...e,
+      quality,
+      qualityReason,
+      topModelsSummary: summarizeTopModels(e.models, 2),
+      modelBreakdown: buildModelBreakdown(e.models)
+    }
+  })
 }
 
 function makeBar(value: number, max: number, width = 10): string {
@@ -1063,12 +1258,37 @@ function pctChange(from: number, to: number): number | null {
   return ((to - from) / from) * 100
 }
 
+interface EffectivePeriodBucket {
+  stat: PeriodStat
+  effectiveDeltaPercent: number
+  effectiveDeltaTokens: number
+  effectiveCostUsd: number
+  effectiveModels: Record<string, ModelTokenUsage>
+  effectiveSampleCount: number
+  excludedZeroCount: number
+  excludedOutlierCount: number
+  hasValidUsd: boolean
+}
+
 function buildTrendsForGranularity(
   periodStats: Record<string, PeriodStat>,
+  ledgerViews: LedgerEntryView[],
   periodType: PeriodGranularity,
   nerfAlertDropPercent: number
 ): { series: TrendSeriesSummary[]; rows: TrendPeriodRow[] } {
-  const bySeries = new Map<string, PeriodStat[]>()
+  // Index raw classified ledger entries by period key so we can compute outlier-free rollups
+  const ledgerByPeriodKey = new Map<string, LedgerEntryView[]>()
+  for (const entry of ledgerViews) {
+    if (entry.deltaPercent <= 0) continue
+    const pKey =
+      periodType === 'week' ? getIsoWeekKey(entry.timestamp) : getMonthKey(entry.timestamp)
+    const fullKey = `${periodType}::${pKey}::${entry.provider}::${entry.accountId}::${entry.windowId}`
+    const list = ledgerByPeriodKey.get(fullKey) ?? []
+    list.push(entry)
+    ledgerByPeriodKey.set(fullKey, list)
+  }
+
+  const bySeries = new Map<string, EffectivePeriodBucket[]>()
 
   for (const stat of Object.values(periodStats)) {
     if (stat.periodType !== periodType || stat.totalDeltaPercent <= 0) continue
@@ -1076,30 +1296,119 @@ function buildTrendsForGranularity(
     if (!isMonthlyValueEligibleWindow(stat.windowMinutes, stat.windowId, stat.windowLabel)) {
       continue
     }
+
+    const rawEntries = ledgerByPeriodKey.get(stat.key)
+    let bucket: EffectivePeriodBucket
+
+    if (rawEntries && rawEntries.length > 0) {
+      let validDeltaPct = 0
+      let validTokens = 0
+      let validCost = 0
+      let validModels: Record<string, ModelTokenUsage> = {}
+      let validCount = 0
+      let zeroCount = 0
+      let outlierCount = 0
+
+      for (const e of rawEntries) {
+        if (e.quality === 'zero_cost') {
+          zeroCount++
+        } else if (e.quality === 'outlier') {
+          outlierCount++
+        } else {
+          validCount++
+          validDeltaPct += e.deltaPercent
+          validTokens += e.deltaTokens
+          validCost += e.deltaCostUsd
+          validModels = mergeModelUsageMaps(validModels, e.models)
+        }
+      }
+
+      if (validCount > 0 && validDeltaPct > 0) {
+        bucket = {
+          stat,
+          effectiveDeltaPercent: validDeltaPct,
+          effectiveDeltaTokens: validTokens,
+          effectiveCostUsd: validCost,
+          effectiveModels: validModels,
+          effectiveSampleCount: validCount,
+          excludedZeroCount: zeroCount,
+          excludedOutlierCount: outlierCount,
+          hasValidUsd: validCost > 0
+        }
+      } else {
+        // Period only had zero-cost or outlier entries
+        bucket = {
+          stat,
+          effectiveDeltaPercent: stat.totalDeltaPercent,
+          effectiveDeltaTokens: stat.totalDeltaTokens,
+          effectiveCostUsd: 0,
+          effectiveModels: {},
+          effectiveSampleCount: stat.sampleCount,
+          excludedZeroCount: zeroCount,
+          excludedOutlierCount: outlierCount,
+          hasValidUsd: false
+        }
+      }
+    } else {
+      // Historical period aged out of raw ledger: validate permanent periodStats sanity
+      const rawUsdRate =
+        stat.totalDeltaPercent > 0 ? stat.totalDeltaCostUsd / stat.totalDeltaPercent : 0
+      const isOutlierRollup = rawUsdRate > MAX_SANE_USD_PER_PERCENT
+      const hasValidUsd = stat.totalDeltaCostUsd > 0 && !isOutlierRollup
+      bucket = {
+        stat,
+        effectiveDeltaPercent: stat.totalDeltaPercent,
+        effectiveDeltaTokens: stat.totalDeltaTokens,
+        effectiveCostUsd: hasValidUsd ? stat.totalDeltaCostUsd : 0,
+        effectiveModels: hasValidUsd ? stat.models : {},
+        effectiveSampleCount: stat.sampleCount,
+        excludedZeroCount: stat.totalDeltaCostUsd <= 0 ? stat.sampleCount : 0,
+        excludedOutlierCount: isOutlierRollup ? stat.sampleCount : 0,
+        hasValidUsd
+      }
+    }
+
     const seriesKey = `${stat.provider}::${stat.accountId}::${stat.windowId}`
     const list = bySeries.get(seriesKey) ?? []
-    list.push(stat)
+    list.push(bucket)
     bySeries.set(seriesKey, list)
   }
 
   const series: TrendSeriesSummary[] = []
   const rows: TrendPeriodRow[] = []
 
-  for (const [seriesKey, items] of bySeries.entries()) {
-    items.sort((a, b) => a.periodKey.localeCompare(b.periodKey))
+  for (const [seriesKey, allBuckets] of bySeries.entries()) {
+    allBuckets.sort((a, b) => a.stat.periodKey.localeCompare(b.stat.periodKey))
 
-    const tokenRates = items.map((s) => Math.round(s.totalDeltaTokens / s.totalDeltaPercent))
-    const usdRates = items.map((s) => s.totalDeltaCostUsd / s.totalDeltaPercent)
-    const monthlyUsdRates = items.map((s, idx) =>
-      estimateMonthlyUsd(usdRates[idx], s.windowMinutes, s.windowId, s.windowLabel)
+    const usdBuckets = allBuckets.filter((b) => b.hasValidUsd)
+    const useUsd = usdBuckets.length > 0
+    // When USD data exists, ignore legacy $0 / outlier-only periods from trend series calculations
+    const activeBuckets = useUsd ? usdBuckets : allBuckets.filter((b) => b.effectiveDeltaTokens > 0)
+    if (activeBuckets.length === 0) continue
+
+    const tokenRates = activeBuckets.map((b) =>
+      b.effectiveDeltaPercent > 0
+        ? Math.round(b.effectiveDeltaTokens / b.effectiveDeltaPercent)
+        : 0
     )
-    // Prefer monthly USD value for enshittification detection whenever baseline has dollar data
-    const useUsd = monthlyUsdRates[0] > 0 && monthlyUsdRates[monthlyUsdRates.length - 1] > 0
+    const usdRates = activeBuckets.map((b) =>
+      b.effectiveDeltaPercent > 0 ? b.effectiveCostUsd / b.effectiveDeltaPercent : 0
+    )
+    const monthlyUsdRates = activeBuckets.map((b, idx) =>
+      estimateMonthlyUsd(
+        usdRates[idx],
+        b.stat.windowMinutes,
+        b.stat.windowId,
+        b.stat.windowLabel
+      )
+    )
+
     const primaryRates = useUsd ? monthlyUsdRates : tokenRates
     const maxPrimary = Math.max(...primaryRates, 0)
     const baselinePrimary = primaryRates[0]
 
-    const seriesRows: TrendPeriodRow[] = items.map((s, idx) => {
+    const seriesRows: TrendPeriodRow[] = activeBuckets.map((b, idx) => {
+      const s = b.stat
       const tRate = tokenRates[idx]
       const uRate = usdRates[idx]
       const mUsd = monthlyUsdRates[idx]
@@ -1114,23 +1423,28 @@ function buildTrendsForGranularity(
         accountLabel: s.accountLabel,
         windowId: s.windowId,
         windowLabel: s.windowLabel,
-        totalDeltaPercent: s.totalDeltaPercent,
-        totalDeltaTokens: s.totalDeltaTokens,
-        totalDeltaCostUsd: s.totalDeltaCostUsd,
+        totalDeltaPercent: b.effectiveDeltaPercent,
+        totalDeltaTokens: b.effectiveDeltaTokens,
+        totalDeltaCostUsd: b.effectiveCostUsd,
         tokensPerPercent: tRate,
         estimated100PercentTokens: tRate * 100,
         usdPerPercent: uRate,
         estimated100PercentUsd: uRate * 100,
         estimatedMonthlyUsd: mUsd,
-        topModelsSummary: summarizeTopModels(s.models, 2),
-        sampleCount: s.sampleCount,
+        topModelsSummary: summarizeTopModels(b.effectiveModels, 2),
+        modelBreakdown: buildModelBreakdown(b.effectiveModels),
+        sampleCount: b.effectiveSampleCount,
+        excludedZeroCount: b.excludedZeroCount,
+        excludedOutlierCount: b.excludedOutlierCount,
+        hasValidUsd: b.hasValidUsd,
         prevChangePercent: prevPrimary !== null ? pctChange(prevPrimary, pRate) : null,
         baselineChangePercent: idx > 0 ? pctChange(baselinePrimary, pRate) : null,
         bar: makeBar(pRate, maxPrimary)
       }
     })
 
-    const latest = items[items.length - 1]
+    const latestBucket = activeBuckets[activeBuckets.length - 1]
+    const latest = latestBucket.stat
     const latestTokenRate = tokenRates[tokenRates.length - 1]
     const latestUsdRate = usdRates[usdRates.length - 1]
     const latestMonthlyUsd = monthlyUsdRates[monthlyUsdRates.length - 1]
@@ -1141,12 +1455,12 @@ function buildTrendsForGranularity(
     const latestPrimary = primaryRates[primaryRates.length - 1]
     const prevPrimary = primaryRates.length >= 2 ? primaryRates[primaryRates.length - 2] : null
 
-    const vsBaseline = items.length >= 2 ? pctChange(baselinePrimary, latestPrimary) : null
+    const vsBaseline = activeBuckets.length >= 2 ? pctChange(baselinePrimary, latestPrimary) : null
     const vsPrevious = prevPrimary !== null ? pctChange(prevPrimary, latestPrimary) : null
 
     let status: DriftStatus = 'collecting'
-    if (items.length >= 2 && vsBaseline !== null) {
-      if (vsBaseline <= -nerfAlertDropPercent && latest.totalDeltaPercent >= 2) {
+    if (activeBuckets.length >= 2 && vsBaseline !== null) {
+      if (vsBaseline <= -nerfAlertDropPercent && latestBucket.effectiveDeltaPercent >= 2) {
         status = 'degraded'
       } else if (vsBaseline <= -(nerfAlertDropPercent / 2)) {
         status = 'watch'
@@ -1154,6 +1468,19 @@ function buildTrendsForGranularity(
         status = 'stable'
       }
     }
+
+    const totalExcludedZero = allBuckets.reduce((sum, b) => sum + b.excludedZeroCount, 0)
+    const totalExcludedOutlier = allBuckets.reduce((sum, b) => sum + b.excludedOutlierCount, 0)
+
+    const points: TrendChartPoint[] = seriesRows.map((r) => ({
+      periodKey: r.periodKey,
+      monthlyUsd: r.estimatedMonthlyUsd,
+      usdPerPercent: r.usdPerPercent,
+      tokensPerPercent: r.tokensPerPercent,
+      deltaPercent: r.totalDeltaPercent,
+      vsBaselinePercent: r.baselineChangePercent,
+      topModelsSummary: r.topModelsSummary
+    }))
 
     series.push({
       seriesKey,
@@ -1163,8 +1490,8 @@ function buildTrendsForGranularity(
       accountLabel: latest.accountLabel,
       windowId: latest.windowId,
       windowLabel: latest.windowLabel,
-      periodCount: items.length,
-      baselinePeriodKey: items[0].periodKey,
+      periodCount: activeBuckets.length,
+      baselinePeriodKey: activeBuckets[0].stat.periodKey,
       baselineTokensPerPercent: tokenRates[0],
       baselineUsdPerPercent: usdRates[0],
       baselineMonthlyUsd: monthlyUsdRates[0],
@@ -1172,14 +1499,17 @@ function buildTrendsForGranularity(
       latestTokensPerPercent: latestTokenRate,
       latestUsdPerPercent: latestUsdRate,
       latestMonthlyUsd,
-      latestDeltaPercent: latest.totalDeltaPercent,
+      latestDeltaPercent: latestBucket.effectiveDeltaPercent,
       previousTokensPerPercent: prevTokenRate,
       previousUsdPerPercent: prevUsdRate,
       previousMonthlyUsd: prevMonthlyUsd,
       vsBaselinePercent: vsBaseline,
       vsPreviousPercent: vsPrevious,
       metricKind: useUsd ? 'usd' : 'tokens',
-      status
+      status,
+      excludedZeroCount: totalExcludedZero,
+      excludedOutlierCount: totalExcludedOutlier,
+      points
     })
 
     rows.push(...seriesRows.reverse())
@@ -1201,26 +1531,91 @@ function buildTrendsForGranularity(
 
 export function buildDashboardView(
   state: TrackerState,
-  nerfAlertDropPercent = 15
+  nerfAlertDropPercent = 15,
+  now = Date.now()
 ): DashboardView {
+  const ledgerViews = classifyLedgerEntries(state.ledger)
+
+  const ledgerByWindowKey = new Map<string, LedgerEntryView[]>()
+  for (const e of ledgerViews) {
+    const key = `${e.provider}::${e.accountId}::${e.windowId}`
+    const list = ledgerByWindowKey.get(key) ?? []
+    list.push(e)
+    ledgerByWindowKey.set(key, list)
+  }
+
   const windows: WindowSummaryView[] = Object.values(state.windows)
     .map((w) => {
+      const isMonthlyEligible = isMonthlyValueEligibleWindow(
+        w.windowMinutes,
+        w.windowId,
+        w.windowLabel
+      )
+      const resetCountdownText = formatResetCountdown(w.resetsAt, w.resetDescription, now)
+
+      // Check if current window cycle contains outlier jumps in raw ledger
+      const cycleEntries = (ledgerByWindowKey.get(w.key) ?? []).filter(
+        (e) => e.timestamp >= w.firstSeenAt
+      )
+      const outlierEntries = cycleEntries.filter((e) => e.quality === 'outlier')
+      const excludedOutlierCount = outlierEntries.length
+
+      let effectiveDeltaPercent = w.trackedDeltaPercent
+      let effectiveTokens = w.trackedTokens
+      let effectiveCostUsd = w.trackedCostUsd
+      let effectiveModels = w.trackedModels
+
+      if (excludedOutlierCount > 0) {
+        const validCycle = cycleEntries.filter((e) => e.quality === 'valid')
+        let sumDelta = 0
+        let sumTokens = w.pendingTokens
+        let sumCost = w.pendingCostUsd
+        let sumModels = mergeModelUsageMaps({}, w.pendingModels)
+        for (const e of validCycle) {
+          sumDelta += e.deltaPercent
+          sumTokens += e.deltaTokens
+          sumCost += e.deltaCostUsd
+          sumModels = mergeModelUsageMaps(sumModels, e.models)
+        }
+        effectiveDeltaPercent = sumDelta
+        effectiveTokens = sumTokens
+        effectiveCostUsd = sumCost
+        effectiveModels = sumModels
+      }
+
       const tokensPerPercent =
-        w.trackedDeltaPercent > 0 ? Math.round(w.trackedTokens / w.trackedDeltaPercent) : null
+        effectiveDeltaPercent > 0 ? Math.round(effectiveTokens / effectiveDeltaPercent) : null
       const estimated100PercentTokens =
         tokensPerPercent !== null ? tokensPerPercent * 100 : null
-      const usdPerPercent =
-        w.trackedDeltaPercent > 0 && w.trackedCostUsd > 0
-          ? w.trackedCostUsd / w.trackedDeltaPercent
-          : null
+
+      // Compute $/1% from valid priced delta (excluding pending un-ticked spend when cycle has valid entries)
+      let usdPerPercent: number | null = null
+      if (excludedOutlierCount > 0) {
+        const validCycle = cycleEntries.filter((e) => e.quality === 'valid')
+        const validDelta = validCycle.reduce((s, e) => s + e.deltaPercent, 0)
+        const validCost = validCycle.reduce((s, e) => s + e.deltaCostUsd, 0)
+        usdPerPercent = validDelta > 0 && validCost > 0 ? validCost / validDelta : null
+      } else if (effectiveDeltaPercent > 0 && effectiveCostUsd > 0) {
+        const rawRate = effectiveCostUsd / effectiveDeltaPercent
+        usdPerPercent = rawRate <= MAX_SANE_USD_PER_PERCENT ? rawRate : null
+      }
+
       const estimated100PercentUsd = usdPerPercent !== null ? usdPerPercent * 100 : null
       const estimatedMonthlyUsd =
-        usdPerPercent !== null
+        usdPerPercent !== null && isMonthlyEligible
           ? estimateMonthlyUsd(usdPerPercent, w.windowMinutes, w.windowId, w.windowLabel)
           : null
-      const modelBreakdown = buildModelBreakdown(w.trackedModels)
+      const modelBreakdown = buildModelBreakdown(effectiveModels)
+
       return {
         ...w,
+        trackedDeltaPercent: effectiveDeltaPercent,
+        trackedTokens: effectiveTokens,
+        trackedCostUsd: effectiveCostUsd,
+        trackedModels: effectiveModels,
+        isMonthlyEligible,
+        resetCountdownText,
+        excludedOutlierCount,
         tokensPerPercent,
         estimated100PercentTokens,
         usdPerPercent,
@@ -1232,11 +1627,84 @@ export function buildDashboardView(
     .sort((a, b) => {
       if (a.isActiveAccount !== b.isActiveAccount) return a.isActiveAccount ? -1 : 1
       if (a.provider !== b.provider) return a.provider.localeCompare(b.provider)
+      // Prefer pacing (weekly/monthly) windows first, then higher usage
+      if (a.isMonthlyEligible !== b.isMonthlyEligible) return a.isMonthlyEligible ? -1 : 1
+      if (b.currentPercent !== a.currentPercent) return b.currentPercent - a.currentPercent
       return (a.windowMinutes ?? 999999) - (b.windowMinutes ?? 999999)
     })
 
-  const weekly = buildTrendsForGranularity(state.periodStats, 'week', nerfAlertDropPercent)
-  const monthly = buildTrendsForGranularity(state.periodStats, 'month', nerfAlertDropPercent)
+  // Group windows into AccountGroupView cards
+  const accountMap = new Map<string, WindowSummaryView[]>()
+  for (const w of windows) {
+    const accKey = `${w.provider}::${w.accountId}`
+    const list = accountMap.get(accKey) ?? []
+    list.push(w)
+    accountMap.set(accKey, list)
+  }
+
+  const accounts: AccountGroupView[] = Array.from(accountMap.entries())
+    .map(([accKey, accWindows]) => {
+      const first = accWindows[0]
+      const isActiveAccount = accWindows.some((w) => w.isActiveAccount)
+      // Avoid double-counting overlapping 5h + weekly windows: prefer disjoint pacing windows
+      const pacingWindows = accWindows.filter(
+        (w) => w.isMonthlyEligible && w.windowId !== 'fableWeekly'
+      )
+      const spendSourceWindows = pacingWindows.length > 0 ? pacingWindows : accWindows
+
+      let totalTrackedCostUsd = 0
+      let totalTrackedTokens = 0
+      let combinedModels: Record<string, ModelTokenUsage> = {}
+      let excludedOutlierCount = 0
+
+      for (const w of spendSourceWindows) {
+        totalTrackedCostUsd += w.trackedCostUsd
+        totalTrackedTokens += w.trackedTokens
+        combinedModels = mergeModelUsageMaps(combinedModels, w.trackedModels)
+      }
+      for (const w of accWindows) {
+        excludedOutlierCount += w.excludedOutlierCount
+      }
+
+      const primaryWin =
+        accWindows.find((w) => w.isMonthlyEligible && w.estimatedMonthlyUsd !== null) ?? null
+
+      return {
+        key: accKey,
+        provider: first.provider,
+        providerName: formatProviderName(first.provider),
+        accountId: first.accountId,
+        accountLabel: first.accountLabel,
+        planType: first.planType,
+        isActiveAccount,
+        windows: accWindows,
+        totalTrackedCostUsd,
+        totalTrackedTokens,
+        primaryMonthlyUsd: primaryWin?.estimatedMonthlyUsd ?? null,
+        excludedOutlierCount,
+        modelBreakdown: buildModelBreakdown(combinedModels)
+      }
+    })
+    .sort((a, b) => {
+      if (a.isActiveAccount !== b.isActiveAccount) return a.isActiveAccount ? -1 : 1
+      if (b.totalTrackedCostUsd !== a.totalTrackedCostUsd) {
+        return b.totalTrackedCostUsd - a.totalTrackedCostUsd
+      }
+      return a.accountLabel.localeCompare(b.accountLabel)
+    })
+
+  const weekly = buildTrendsForGranularity(
+    state.periodStats,
+    ledgerViews,
+    'week',
+    nerfAlertDropPercent
+  )
+  const monthly = buildTrendsForGranularity(
+    state.periodStats,
+    ledgerViews,
+    'month',
+    nerfAlertDropPercent
+  )
 
   const degradedAlerts = [
     ...weekly.series.filter((s) => s.status === 'degraded'),
@@ -1248,12 +1716,30 @@ export function buildDashboardView(
       (w) =>
         w.isActiveAccount &&
         w.estimatedMonthlyUsd !== null &&
-        inferWindowMinutes(w.windowMinutes, w.windowId, w.windowLabel) >= 7 * 24 * 60
+        w.isMonthlyEligible
     ) ??
-    windows.find((w) => w.isActiveAccount && w.estimatedMonthlyUsd !== null) ??
     windows.find((w) => w.isActiveAccount && w.trackedDeltaPercent > 0) ??
     windows.find((w) => w.isActiveAccount) ??
     windows[0]
+
+  const primarySeries = primary
+    ? weekly.series.find((s) => s.seriesKey === primary.key) ??
+      monthly.series.find((s) => s.seriesKey === primary.key)
+    : undefined
+
+  const validLedgerCount = ledgerViews.filter((e) => e.quality === 'valid').length
+  const summary: DashboardSummaryView = {
+    totalTrackedCostUsd: accounts.reduce((sum, a) => sum + a.totalTrackedCostUsd, 0),
+    totalTrackedTokens: accounts.reduce((sum, a) => sum + a.totalTrackedTokens, 0),
+    activeAccountCount: accounts.filter((a) => a.isActiveAccount).length,
+    totalAccountCount: accounts.length,
+    alertCount: degradedAlerts.length,
+    primaryMonthlyUsd: primary?.estimatedMonthlyUsd ?? primarySeries?.latestMonthlyUsd ?? null,
+    primaryLabel: primary ? `${formatProviderName(primary.provider)}` : null,
+    primaryStatus: primarySeries?.status ?? 'collecting',
+    validLedgerCount,
+    excludedLedgerCount: ledgerViews.length - validLedgerCount
+  }
 
   let statusBarText = 'Token Tracker'
   let statusBarTooltip = '계정별 사용량 및 추정 월간 달러 가치($/월) 감시'
@@ -1263,9 +1749,9 @@ export function buildDashboardView(
     const providerShort = formatProviderName(primary.provider)
     const ratePart =
       primary.estimatedMonthlyUsd !== null
-        ? ` · ~${formatUsd(primary.estimatedMonthlyUsd)}/월`
+        ? ` · ~${formatUsdCompact(primary.estimatedMonthlyUsd)}/월`
         : primary.trackedCostUsd > 0
-          ? ` · +${formatUsd(primary.trackedCostUsd)}`
+          ? ` · +${formatUsdCompact(primary.trackedCostUsd)}`
           : ''
     const alertSuffix = degradedAlerts.length > 0 ? ' ⚠' : ''
     statusBarText = `${providerShort} ${primary.currentPercent}%${ratePart}${alertSuffix}`
@@ -1288,8 +1774,11 @@ export function buildDashboardView(
     lastPollAt: state.lastPollAt,
     lastError: state.lastError,
     nerfAlertDropPercent,
+    summary,
+    accounts,
     windows,
     ledger: state.ledger,
+    ledgerViews,
     weeklySeries: weekly.series,
     weeklyRows: weekly.rows,
     monthlySeries: monthly.series,
@@ -1302,6 +1791,7 @@ export function buildDashboardView(
 }
 
 export function buildLedgerCsv(ledger: LedgerEntry[]): string {
+  const views = classifyLedgerEntries(ledger)
   const header = [
     'timestamp',
     'provider',
@@ -1314,6 +1804,7 @@ export function buildLedgerCsv(ledger: LedgerEntry[]): string {
     'usd_per_1pct',
     'delta_tokens',
     'tokens_per_1pct',
+    'quality',
     'models',
     'sessions'
   ].join(',')
@@ -1323,7 +1814,7 @@ export function buildLedgerCsv(ledger: LedgerEntry[]): string {
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
   }
 
-  const rows = ledger.map((e) =>
+  const rows = views.map((e) =>
     [
       new Date(e.timestamp).toISOString(),
       e.provider,
@@ -1336,6 +1827,7 @@ export function buildLedgerCsv(ledger: LedgerEntry[]): string {
       e.usdPerPercent.toFixed(4),
       e.deltaTokens,
       e.tokensPerPercent,
+      e.quality,
       summarizeTopModels(e.models, 5),
       e.sessionTitles.join(' | ')
     ]
@@ -1361,7 +1853,9 @@ export function buildTrendsCsv(rows: TrendPeriodRow[]): string {
     'top_models',
     'prev_change_pct',
     'baseline_change_pct',
-    'samples'
+    'samples',
+    'excluded_zero',
+    'excluded_outlier'
   ].join(',')
 
   const escape = (v: string | number | null): string => {
@@ -1385,7 +1879,9 @@ export function buildTrendsCsv(rows: TrendPeriodRow[]): string {
       r.topModelsSummary,
       r.prevChangePercent !== null ? r.prevChangePercent.toFixed(1) : null,
       r.baselineChangePercent !== null ? r.baselineChangePercent.toFixed(1) : null,
-      r.sampleCount
+      r.sampleCount,
+      r.excludedZeroCount,
+      r.excludedOutlierCount
     ]
       .map(escape)
       .join(',')
