@@ -143,16 +143,6 @@ function WindowCard(w: WindowSummaryView) {
       ? `+${w.trackedDeltaPercent}% (${w.baselinePercent}% → ${w.currentPercent}%)`
       : `0% (기준 ${w.baselinePercent}%)`
 
-  const usdPerPctText =
-    w.usdPerPercent !== null
-      ? `${formatUsd(w.usdPerPercent)} / 1%`
-      : w.trackedCostUsd > 0
-        ? `대기 중 (+${formatUsd(w.trackedCostUsd)}, % 변화 전)`
-        : '데이터 수집 중'
-
-  const est100UsdText =
-    w.estimated100PercentUsd !== null ? `약 ${formatUsd(w.estimated100PercentUsd)}` : '-'
-
   const spentText =
     w.trackedCostUsd > 0
       ? `${formatUsd(w.trackedCostUsd)} (${formatTokens(w.trackedTokens)} tok)`
@@ -187,20 +177,8 @@ function WindowCard(w: WindowSummaryView) {
         <Progress label={`${w.windowLabel} usage`} labelHidden value={w.currentPercent} />
         <KeyValue
           items={[
-            {
-              label: '1%당 달러 가치',
-              value: usdPerPctText,
-              tone: w.usdPerPercent !== null ? 'success' : 'neutral',
-              code: w.usdPerPercent !== null
-            },
-            {
-              label: '100% 추정 가치',
-              value: est100UsdText,
-              tone: w.estimated100PercentUsd !== null ? 'accent' : 'neutral',
-              code: w.estimated100PercentUsd !== null
-            },
             { label: '추적 구간 Δ%', value: deltaText },
-            { label: '누적 API 환산액', value: spentText }
+            { label: '누적 사용량', value: spentText, tone: w.trackedCostUsd > 0 ? 'accent' : 'neutral' }
           ]}
         />
         {w.modelBreakdown.length > 0 ? (
@@ -234,10 +212,10 @@ function TrendSeriesCard(s: TrendSeriesSummary) {
           ? 'warning'
           : 'success'
 
-  const fmtRate = (usd: number, tok: number) =>
+  const fmtMonthly = (monthlyUsd: number, tokPerPct: number) =>
     s.metricKind === 'usd'
-      ? `${formatUsd(usd)} / 1% (100% ≈ ${formatUsd(usd * 100)})`
-      : `${formatTokens(tok)} tok / 1%`
+      ? `약 ${formatUsd(monthlyUsd)} / 월`
+      : `${formatTokens(tokPerPct)} tok / 1%`
 
   return (
     <Card
@@ -256,17 +234,17 @@ function TrendSeriesCard(s: TrendSeriesSummary) {
           items={[
             {
               label: `기준 (${s.baselinePeriodKey})`,
-              value: fmtRate(s.baselineUsdPerPercent, s.baselineTokensPerPercent),
+              value: fmtMonthly(s.baselineMonthlyUsd, s.baselineTokensPerPercent),
               code: true
             },
             {
               label: `최근 (${s.latestPeriodKey})`,
-              value: fmtRate(s.latestUsdPerPercent, s.latestTokensPerPercent),
+              value: fmtMonthly(s.latestMonthlyUsd, s.latestTokensPerPercent),
               tone: baseTone,
               code: true
             },
             {
-              label: '기준 대비 가치 변화',
+              label: '기준 대비 월 가치 변화',
               value: formatSignedPercent(s.vsBaselinePercent),
               tone: baseTone
             },
@@ -287,8 +265,8 @@ const TREND_COLUMNS: readonly TableColumn[] = [
   { key: 'period', label: '기간', width: 'sm' },
   { key: 'account', label: '계정 · 윈도우', width: 'md' },
   { key: 'delta', label: 'Δ%', align: 'end', width: 'xs' },
-  { key: 'usdPerPct', label: '$/1%', align: 'end', width: 'sm' },
-  { key: 'est100', label: '100% 가치', align: 'end', width: 'sm', hideBelow: 'sm' },
+  { key: 'monthlyUsd', label: '추정 월 가치', align: 'end', width: 'sm' },
+  { key: 'prevDiff', label: '전기간', align: 'end', width: 'xs', hideBelow: 'sm' },
   { key: 'baseDiff', label: '기준대비', align: 'end', width: 'sm' },
   { key: 'bar', label: '추이', width: 'sm', hideBelow: 'md' }
 ]
@@ -300,8 +278,11 @@ function toTrendRows(entries: TrendPeriodRow[]): TableRow[] {
       period: r.periodKey,
       account: `${r.accountLabel} · ${r.windowLabel}`,
       delta: `+${r.totalDeltaPercent}%`,
-      usdPerPct: r.usdPerPercent > 0 ? formatUsd(r.usdPerPercent) : `${formatTokens(r.tokensPerPercent)} tok`,
-      est100: r.estimated100PercentUsd > 0 ? formatUsd(r.estimated100PercentUsd) : '-',
+      monthlyUsd:
+        r.estimatedMonthlyUsd > 0
+          ? `${formatUsd(r.estimatedMonthlyUsd)}/월`
+          : `${formatTokens(r.tokensPerPercent)} tok`,
+      prevDiff: formatSignedPercent(r.prevChangePercent),
       baseDiff: formatSignedPercent(r.baselineChangePercent),
       bar: r.bar
     }
@@ -400,12 +381,12 @@ export default function Panel() {
       </Row>
 
       {activeAlerts.length > 0 ? (
-        <Callout tone="danger" title="1%당 달러 가치 하락 (Enshittification) 의심" icon="warning">
+        <Callout tone="danger" title="추정 월 가치 하락 (Enshittification) 의심" icon="warning">
           <Stack gap="xs">
             {activeAlerts.map((a) => (
               <Text key={`${a.periodType}-${a.seriesKey}`} size="xs">
                 {a.metricKind === 'usd'
-                  ? `${a.accountLabel} (${a.windowLabel}, ${a.periodType === 'week' ? '주간' : '월간'}): 1%당 가치 ${formatUsd(a.baselineUsdPerPercent)} → ${formatUsd(a.latestUsdPerPercent)} (${formatSignedPercent(a.vsBaselinePercent)})`
+                  ? `${a.accountLabel} (${a.windowLabel}, ${a.periodType === 'week' ? '주간' : '월간'}): 추정 월 가치 ${formatUsd(a.baselineMonthlyUsd)}/월 → ${formatUsd(a.latestMonthlyUsd)}/월 (${formatSignedPercent(a.vsBaselinePercent)})`
                   : `${a.accountLabel} (${a.windowLabel}, ${a.periodType === 'week' ? '주간' : '월간'}): 1%당 ${formatTokens(a.baselineTokensPerPercent)} → ${formatTokens(a.latestTokensPerPercent)} (${formatSignedPercent(a.vsBaselinePercent)})`}
               </Text>
             ))}
@@ -465,21 +446,21 @@ export default function Panel() {
                 onChange={(v) => set(trendGranularity, v as PeriodGranularity)}
               />
               <Text muted size="xs">
-                경고 기준: $/1% -{view?.nerfAlertDropPercent ?? 15}% 이하
+                경고 기준: 추정 월 가치 -{view?.nerfAlertDropPercent ?? 15}% 이하
               </Text>
             </Row>
 
             {activeSeries.length === 0 ? (
               <EmptyState
                 title="주간/월간 추이 데이터가 아직 없습니다"
-                description="쿼터 %가 1% 이상 상승한 기록이 쌓이면 모델별 API 단가 기준 $/1% 변화와 가치 하락률을 자동으로 감시합니다."
+                description="쿼터 %가 1% 이상 상승한 기록이 쌓이면 모델별 API 단가 기준 추정 한 달치 달러 가치($/월) 변화와 하락률을 자동으로 감시합니다."
                 icon="bar-chart-3"
               />
             ) : (
               <Stack gap="sm">
                 {activeSeries.map((s) => TrendSeriesCard(s))}
                 <Table
-                  label="Weekly and monthly USD per 1% history"
+                  label="Weekly and monthly estimated monthly USD history"
                   columns={TREND_COLUMNS}
                   rows={toTrendRows(activeTrendRows)}
                   maxHeight="lg"

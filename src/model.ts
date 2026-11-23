@@ -68,6 +68,7 @@ export interface LedgerEntry {
   accountLabel: string
   windowId: string
   windowLabel: string
+  windowMinutes?: number | null
   fromPercent: number
   toPercent: number
   deltaPercent: number
@@ -90,6 +91,7 @@ export interface PeriodStat {
   accountLabel: string
   windowId: string
   windowLabel: string
+  windowMinutes?: number | null
   totalDeltaPercent: number
   totalDeltaTokens: number
   totalDeltaCostUsd: number
@@ -134,6 +136,7 @@ export interface WindowSummaryView extends WindowTracker {
   estimated100PercentTokens: number | null
   usdPerPercent: number | null
   estimated100PercentUsd: number | null
+  estimatedMonthlyUsd: number | null
   modelBreakdown: ModelBreakdownItem[]
 }
 
@@ -155,6 +158,7 @@ export interface TrendPeriodRow {
   estimated100PercentTokens: number
   usdPerPercent: number
   estimated100PercentUsd: number
+  estimatedMonthlyUsd: number
   topModelsSummary: string
   sampleCount: number
   prevChangePercent: number | null
@@ -174,12 +178,15 @@ export interface TrendSeriesSummary {
   baselinePeriodKey: string
   baselineTokensPerPercent: number
   baselineUsdPerPercent: number
+  baselineMonthlyUsd: number
   latestPeriodKey: string
   latestTokensPerPercent: number
   latestUsdPerPercent: number
+  latestMonthlyUsd: number
   latestDeltaPercent: number
   previousTokensPerPercent: number | null
   previousUsdPerPercent: number | null
+  previousMonthlyUsd: number | null
   vsBaselinePercent: number | null
   vsPreviousPercent: number | null
   metricKind: 'usd' | 'tokens'
@@ -232,6 +239,39 @@ export function getMonthKey(timestampMs: number): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
 }
 
+const MINUTES_PER_MONTH = 30 * 24 * 60 // 43,200 minutes (30 days)
+
+/** Resolves a quota window's length in minutes from explicit metadata or its id/label. */
+export function inferWindowMinutes(
+  windowMinutes: number | null | undefined,
+  windowId: string,
+  windowLabel: string
+): number {
+  if (typeof windowMinutes === 'number' && Number.isFinite(windowMinutes) && windowMinutes > 0) {
+    return windowMinutes
+  }
+  const combined = `${windowId} ${windowLabel}`.toLowerCase()
+  if (combined.includes('month') || combined.includes('30d')) return MINUTES_PER_MONTH
+  if (combined.includes('week') || combined.includes('7d')) return 7 * 24 * 60
+  if (combined.includes('five hour') || combined.includes('5h') || windowId === 'session') {
+    return 5 * 60
+  }
+  return 7 * 24 * 60
+}
+
+/** Converts a $/1% rate for a quota window into an estimated 30-day (monthly) total dollar value. */
+export function estimateMonthlyUsd(
+  usdPerPercent: number,
+  windowMinutes: number | null | undefined,
+  windowId: string,
+  windowLabel: string
+): number {
+  if (!Number.isFinite(usdPerPercent) || usdPerPercent <= 0) return 0
+  const mins = inferWindowMinutes(windowMinutes, windowId, windowLabel)
+  const cyclesPerMonth = MINUTES_PER_MONTH / mins
+  return usdPerPercent * 100 * cyclesPerMonth
+}
+
 function recordPeriodRollup(
   periodStats: Record<string, PeriodStat>,
   entry: LedgerEntry,
@@ -253,6 +293,7 @@ function recordPeriodRollup(
       accountLabel: entry.accountLabel,
       windowId: entry.windowId,
       windowLabel: entry.windowLabel,
+      windowMinutes: entry.windowMinutes ?? null,
       totalDeltaPercent: entry.deltaPercent,
       totalDeltaTokens: entry.deltaTokens,
       totalDeltaCostUsd: entry.deltaCostUsd,
@@ -266,6 +307,7 @@ function recordPeriodRollup(
       ...existing,
       accountLabel: entry.accountLabel,
       windowLabel: entry.windowLabel,
+      windowMinutes: entry.windowMinutes ?? existing.windowMinutes ?? null,
       totalDeltaPercent: existing.totalDeltaPercent + entry.deltaPercent,
       totalDeltaTokens: existing.totalDeltaTokens + entry.deltaTokens,
       totalDeltaCostUsd: existing.totalDeltaCostUsd + entry.deltaCostUsd,
@@ -888,6 +930,7 @@ export function applySnapshot(
         accountLabel: sample.accountLabel,
         windowId: sample.windowId,
         windowLabel: sample.windowLabel,
+        windowMinutes: sample.windowMinutes ?? existing.windowMinutes,
         fromPercent: existing.currentPercent,
         toPercent: sample.usedPercent,
         deltaPercent,
@@ -978,15 +1021,19 @@ function buildTrendsForGranularity(
 
     const tokenRates = items.map((s) => Math.round(s.totalDeltaTokens / s.totalDeltaPercent))
     const usdRates = items.map((s) => s.totalDeltaCostUsd / s.totalDeltaPercent)
-    // Prefer USD-per-1% for enshittification detection whenever baseline has dollar data
-    const useUsd = usdRates[0] > 0 && usdRates[usdRates.length - 1] > 0
-    const primaryRates = useUsd ? usdRates : tokenRates
+    const monthlyUsdRates = items.map((s, idx) =>
+      estimateMonthlyUsd(usdRates[idx], s.windowMinutes, s.windowId, s.windowLabel)
+    )
+    // Prefer monthly USD value for enshittification detection whenever baseline has dollar data
+    const useUsd = monthlyUsdRates[0] > 0 && monthlyUsdRates[monthlyUsdRates.length - 1] > 0
+    const primaryRates = useUsd ? monthlyUsdRates : tokenRates
     const maxPrimary = Math.max(...primaryRates, 0)
     const baselinePrimary = primaryRates[0]
 
     const seriesRows: TrendPeriodRow[] = items.map((s, idx) => {
       const tRate = tokenRates[idx]
       const uRate = usdRates[idx]
+      const mUsd = monthlyUsdRates[idx]
       const pRate = primaryRates[idx]
       const prevPrimary = idx > 0 ? primaryRates[idx - 1] : null
       return {
@@ -1005,6 +1052,7 @@ function buildTrendsForGranularity(
         estimated100PercentTokens: tRate * 100,
         usdPerPercent: uRate,
         estimated100PercentUsd: uRate * 100,
+        estimatedMonthlyUsd: mUsd,
         topModelsSummary: summarizeTopModels(s.models, 2),
         sampleCount: s.sampleCount,
         prevChangePercent: prevPrimary !== null ? pctChange(prevPrimary, pRate) : null,
@@ -1016,8 +1064,11 @@ function buildTrendsForGranularity(
     const latest = items[items.length - 1]
     const latestTokenRate = tokenRates[tokenRates.length - 1]
     const latestUsdRate = usdRates[usdRates.length - 1]
+    const latestMonthlyUsd = monthlyUsdRates[monthlyUsdRates.length - 1]
     const prevTokenRate = tokenRates.length >= 2 ? tokenRates[tokenRates.length - 2] : null
     const prevUsdRate = usdRates.length >= 2 ? usdRates[usdRates.length - 2] : null
+    const prevMonthlyUsd =
+      monthlyUsdRates.length >= 2 ? monthlyUsdRates[monthlyUsdRates.length - 2] : null
     const latestPrimary = primaryRates[primaryRates.length - 1]
     const prevPrimary = primaryRates.length >= 2 ? primaryRates[primaryRates.length - 2] : null
 
@@ -1047,12 +1098,15 @@ function buildTrendsForGranularity(
       baselinePeriodKey: items[0].periodKey,
       baselineTokensPerPercent: tokenRates[0],
       baselineUsdPerPercent: usdRates[0],
+      baselineMonthlyUsd: monthlyUsdRates[0],
       latestPeriodKey: latest.periodKey,
       latestTokensPerPercent: latestTokenRate,
       latestUsdPerPercent: latestUsdRate,
+      latestMonthlyUsd,
       latestDeltaPercent: latest.totalDeltaPercent,
       previousTokensPerPercent: prevTokenRate,
       previousUsdPerPercent: prevUsdRate,
+      previousMonthlyUsd: prevMonthlyUsd,
       vsBaselinePercent: vsBaseline,
       vsPreviousPercent: vsPrevious,
       metricKind: useUsd ? 'usd' : 'tokens',
@@ -1091,6 +1145,10 @@ export function buildDashboardView(
           ? w.trackedCostUsd / w.trackedDeltaPercent
           : null
       const estimated100PercentUsd = usdPerPercent !== null ? usdPerPercent * 100 : null
+      const estimatedMonthlyUsd =
+        usdPerPercent !== null
+          ? estimateMonthlyUsd(usdPerPercent, w.windowMinutes, w.windowId, w.windowLabel)
+          : null
       const modelBreakdown = buildModelBreakdown(w.trackedModels)
       return {
         ...w,
@@ -1098,6 +1156,7 @@ export function buildDashboardView(
         estimated100PercentTokens,
         usdPerPercent,
         estimated100PercentUsd,
+        estimatedMonthlyUsd,
         modelBreakdown
       }
     })
@@ -1116,32 +1175,36 @@ export function buildDashboardView(
   ]
 
   const primary =
-    windows.find((w) => w.isActiveAccount && w.usdPerPercent !== null) ??
+    windows.find(
+      (w) =>
+        w.isActiveAccount &&
+        w.estimatedMonthlyUsd !== null &&
+        inferWindowMinutes(w.windowMinutes, w.windowId, w.windowLabel) >= 7 * 24 * 60
+    ) ??
+    windows.find((w) => w.isActiveAccount && w.estimatedMonthlyUsd !== null) ??
     windows.find((w) => w.isActiveAccount && w.trackedDeltaPercent > 0) ??
     windows.find((w) => w.isActiveAccount) ??
     windows[0]
 
   let statusBarText = 'Token Tracker'
-  let statusBarTooltip = '계정별 % 대비 모델별 달러 환산 가치($/1%) 감시'
+  let statusBarTooltip = '계정별 사용량 및 추정 월간 달러 가치($/월) 감시'
   let statusBarTone: DashboardView['statusBarTone'] = 'neutral'
 
   if (primary) {
     const providerShort = formatProviderName(primary.provider)
     const ratePart =
-      primary.usdPerPercent !== null
-        ? ` · ${formatUsd(primary.usdPerPercent)}/1%`
+      primary.estimatedMonthlyUsd !== null
+        ? ` · ~${formatUsd(primary.estimatedMonthlyUsd)}/월`
         : primary.trackedCostUsd > 0
           ? ` · +${formatUsd(primary.trackedCostUsd)}`
-          : primary.tokensPerPercent !== null
-            ? ` · ${formatTokens(primary.tokensPerPercent)}/1%`
-            : ''
+          : ''
     const alertSuffix = degradedAlerts.length > 0 ? ' ⚠' : ''
     statusBarText = `${providerShort} ${primary.currentPercent}%${ratePart}${alertSuffix}`
     statusBarTooltip =
       `${primary.accountLabel} (${primary.windowLabel})\n` +
       `현재 ${primary.currentPercent}% · 추적 Δ${primary.trackedDeltaPercent}% / ${formatUsd(primary.trackedCostUsd)} (${formatTokens(primary.trackedTokens)} tok)` +
-      (primary.usdPerPercent !== null
-        ? `\n1%당 약 ${formatUsd(primary.usdPerPercent)} (100% 추정 가치: ${formatUsd(primary.estimated100PercentUsd)})`
+      (primary.estimatedMonthlyUsd !== null
+        ? `\n추정 한 달치 가치: 약 ${formatUsd(primary.estimatedMonthlyUsd)}/월`
         : '') +
       (degradedAlerts.length > 0
         ? `\n⚠ 가치 하락(Enshittification) 의심: ${degradedAlerts[0].accountLabel} (${formatSignedPercent(degradedAlerts[0].vsBaselinePercent)})`
@@ -1223,10 +1286,9 @@ export function buildTrendsCsv(rows: TrendPeriodRow[]): string {
     'window',
     'tracked_delta_percent',
     'tracked_cost_usd',
+    'estimated_monthly_usd',
     'usd_per_1pct',
-    'estimated_100pct_usd',
     'tracked_tokens',
-    'tokens_per_1pct',
     'top_models',
     'prev_change_pct',
     'baseline_change_pct',
@@ -1248,10 +1310,9 @@ export function buildTrendsCsv(rows: TrendPeriodRow[]): string {
       r.windowLabel,
       r.totalDeltaPercent,
       r.totalDeltaCostUsd.toFixed(4),
+      r.estimatedMonthlyUsd.toFixed(2),
       r.usdPerPercent.toFixed(4),
-      r.estimated100PercentUsd.toFixed(2),
       r.totalDeltaTokens,
-      r.tokensPerPercent,
       r.topModelsSummary,
       r.prevChangePercent !== null ? r.prevChangePercent.toFixed(1) : null,
       r.baselineChangePercent !== null ? r.baselineChangePercent.toFixed(1) : null,

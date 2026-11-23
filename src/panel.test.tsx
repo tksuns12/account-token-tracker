@@ -37,6 +37,7 @@ const mockView: DashboardView = {
       estimated100PercentTokens: 12_000_000,
       usdPerPercent: 1.5,
       estimated100PercentUsd: 150,
+      estimatedMonthlyUsd: 642.86,
       modelBreakdown: [
         {
           model: 'claude-opus-5-5',
@@ -85,12 +86,15 @@ const mockView: DashboardView = {
       baselinePeriodKey: '2026-W46',
       baselineTokensPerPercent: 150_000,
       baselineUsdPerPercent: 2.0,
+      baselineMonthlyUsd: 857.14,
       latestPeriodKey: '2026-W47',
       latestTokensPerPercent: 120_000,
       latestUsdPerPercent: 1.5,
+      latestMonthlyUsd: 642.86,
       latestDeltaPercent: 8,
       previousTokensPerPercent: 150_000,
       previousUsdPerPercent: 2.0,
+      previousMonthlyUsd: 857.14,
       vsBaselinePercent: -25,
       vsPreviousPercent: -25,
       metricKind: 'usd',
@@ -114,6 +118,7 @@ const mockView: DashboardView = {
       estimated100PercentTokens: 12_000_000,
       usdPerPercent: 1.5,
       estimated100PercentUsd: 150,
+      estimatedMonthlyUsd: 642.86,
       topModelsSummary: 'opus-5-5 $12.00',
       sampleCount: 4,
       prevChangePercent: -25,
@@ -136,12 +141,15 @@ const mockView: DashboardView = {
       baselinePeriodKey: '2026-W46',
       baselineTokensPerPercent: 150_000,
       baselineUsdPerPercent: 2.0,
+      baselineMonthlyUsd: 857.14,
       latestPeriodKey: '2026-W47',
       latestTokensPerPercent: 120_000,
       latestUsdPerPercent: 1.5,
+      latestMonthlyUsd: 642.86,
       latestDeltaPercent: 8,
       previousTokensPerPercent: 150_000,
       previousUsdPerPercent: 2.0,
+      previousMonthlyUsd: 857.14,
       vsBaselinePercent: -25,
       vsPreviousPercent: -25,
       metricKind: 'usd',
@@ -165,11 +173,13 @@ test('renders USD/1% value, model breakdown, enshittification alert, and refresh
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: /21% 사용/ }))
   assert.ok(view.find({ type: 'Callout' }))
+  assert.ok(view.find({ text: /추정 월 가치 \$857\/월 → \$643\/월/ }))
   const kv = view.find({ type: 'KeyValue' })
   assert.ok(kv)
   const items = kv.props.items as Array<{ label: string; value: string }>
-  assert.equal(items.find((i) => i.label === '1%당 달러 가치')?.value, '$1.50 / 1%')
-  assert.equal(items.find((i) => i.label === '100% 추정 가치')?.value, '약 $150')
+  // Account overview intentionally hides $/1% and monthly value
+  assert.equal(items.find((i) => i.label === '1%당 달러 가치'), undefined)
+  assert.equal(items.find((i) => i.label === '누적 사용량')?.value, '$4.50 (360.0K tok)')
 
   await view.press({ text: '지금 측정' })
   assert.equal(refreshed, true)

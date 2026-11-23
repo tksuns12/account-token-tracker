@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "account-token-tracker",
   "name": "Account Token Tracker",
-  "version": "0.3.1",
-  "description": "Tracks per-account quota % vs per-model token breakdown and API dollar value ($/1%), with weekly/monthly trends to detect quota enshittification.",
+  "version": "0.3.2",
+  "description": "Tracks per-account quota % and per-model usage, estimating monthly dollar value ($/mo) week-over-week and month-over-month to detect quota enshittification.",
   "author": {
     "name": "tksuns12",
     "url": "https://github.com/tksuns12"
