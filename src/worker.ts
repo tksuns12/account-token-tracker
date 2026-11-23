@@ -1,6 +1,10 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { OrcaWorkerApi } from 'orca/worker'
+import {
+  scanAntigravityLocalDeltas,
+  type AntigravityDeltaScanResult
+} from './antigravity-logs'
 import { scanClaudeLocalDeltas, type ClaudeDeltaScanResult } from './claude-logs'
 import {
   applySnapshot,
@@ -39,8 +43,16 @@ export type LocalClaudeDeltaFetcher = (
   overrides?: CustomPricingOverrides
 ) => ClaudeDeltaScanResult
 
+export type LocalAntigravityDeltaFetcher = (
+  prevOffsets: Record<string, number>,
+  isBaseline: boolean,
+  lastPollAt: number | null,
+  overrides?: CustomPricingOverrides
+) => AntigravityDeltaScanResult
+
 let customFetcher: AccountListFetcher | null = null
 let customClaudeDeltaFetcher: LocalClaudeDeltaFetcher | null = null
+let customAntigravityDeltaFetcher: LocalAntigravityDeltaFetcher | null = null
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let debounceTimer: ReturnType<typeof setTimeout> | null = null
 let inFlightRefresh: Promise<DashboardView> | null = null
@@ -54,6 +66,13 @@ export function setAccountListFetcherForTests(fetcher: AccountListFetcher | null
 /** Allows unit tests to inject a mock incremental Claude JSONL scanner. */
 export function setClaudeDeltaFetcherForTests(fetcher: LocalClaudeDeltaFetcher | null): void {
   customClaudeDeltaFetcher = fetcher
+}
+
+/** Allows unit tests to inject a mock incremental Antigravity transcript scanner. */
+export function setAntigravityDeltaFetcherForTests(
+  fetcher: LocalAntigravityDeltaFetcher | null
+): void {
+  customAntigravityDeltaFetcher = fetcher
 }
 
 async function fetchAccountQuotasFromCli(): Promise<QuotaWindowSample[]> {
@@ -130,6 +149,7 @@ async function collectUsageData(
   sessions: SessionRecord[]
   directProviderDeltas: Record<string, Record<string, ModelTokenUsage>>
   nextClaudeOffsets: Record<string, number>
+  nextAntigravityOffsets: Record<string, number>
 }> {
   const isBaseline = prevState.lastPollAt === null
 
@@ -158,9 +178,37 @@ async function collectUsageData(
     orca.log(`scanClaudeLocalDeltas failed: ${String(err)}`)
   }
 
+  let agDelta: AntigravityDeltaScanResult = {
+    nextOffsets: prevState.antigravityFileOffsets,
+    deltaModels: {},
+    deltaTokens: 0,
+    deltaCostUsd: 0,
+    hasLocalLogs: false
+  }
+  try {
+    agDelta = customAntigravityDeltaFetcher
+      ? customAntigravityDeltaFetcher(
+          prevState.antigravityFileOffsets,
+          isBaseline,
+          prevState.lastPollAt,
+          customPricing
+        )
+      : scanAntigravityLocalDeltas(
+          prevState.antigravityFileOffsets,
+          isBaseline,
+          prevState.lastPollAt,
+          customPricing
+        )
+  } catch (err) {
+    orca.log(`scanAntigravityLocalDeltas failed: ${String(err)}`)
+  }
+
   const directProviderDeltas: Record<string, Record<string, ModelTokenUsage>> = {}
   if (Object.keys(claudeDelta.deltaModels).length > 0) {
     directProviderDeltas.claude = claudeDelta.deltaModels
+  }
+  if (Object.keys(agDelta.deltaModels).length > 0) {
+    directProviderDeltas.antigravity = agDelta.deltaModels
   }
 
   const sessions: SessionRecord[] = []
@@ -168,10 +216,9 @@ async function collectUsageData(
     try {
       const res = await orca.host.call('agent.listSessions', { limit: 200 })
       for (const s of res.sessions) {
-        // Avoid double-counting Claude when local JSONL logs are being tailed directly
-        if (claudeDelta.hasLocalLogs && normalizeAgentToProvider(s.agent) === 'claude') {
-          continue
-        }
+        const prov = normalizeAgentToProvider(s.agent)
+        if (claudeDelta.hasLocalLogs && prov === 'claude') continue
+        if (agDelta.hasLocalLogs && prov === 'antigravity') continue
         sessions.push({
           sessionId: s.sessionId,
           agent: s.agent,
@@ -189,7 +236,8 @@ async function collectUsageData(
   return {
     sessions,
     directProviderDeltas,
-    nextClaudeOffsets: claudeDelta.nextOffsets
+    nextClaudeOffsets: claudeDelta.nextOffsets,
+    nextAntigravityOffsets: agDelta.nextOffsets
   }
 }
 
@@ -211,7 +259,8 @@ async function runRefresh(orca: OrcaWorkerApi): Promise<DashboardView> {
         now,
         maxLedgerEntries,
         usageData.directProviderDeltas,
-        usageData.nextClaudeOffsets
+        usageData.nextClaudeOffsets,
+        usageData.nextAntigravityOffsets
       )
       await orca.storage.set(STATE_KEY, toPlainJson(next))
       const view = buildDashboardView(next, nerfAlertDropPercent)

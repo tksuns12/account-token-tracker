@@ -1,3 +1,4 @@
+import { filterModelsForWindow } from './antigravity-logs'
 import {
   addModelUsage,
   createEmptyModelUsage,
@@ -117,6 +118,7 @@ export interface TrackerState {
   periodStats: Record<string, PeriodStat>
   sessionTokens: Record<string, StoredSessionBaseline>
   claudeFileOffsets: Record<string, number>
+  antigravityFileOffsets: Record<string, number>
 }
 
 export interface ModelBreakdownItem {
@@ -218,7 +220,8 @@ export function createEmptyState(): TrackerState {
     ledger: [],
     periodStats: {},
     sessionTokens: {},
-    claudeFileOffsets: {}
+    claudeFileOffsets: {},
+    antigravityFileOffsets: {}
   }
 }
 
@@ -389,6 +392,10 @@ export function migrateState(raw: unknown): TrackerState {
     claudeFileOffsets:
       obj.claudeFileOffsets && typeof obj.claudeFileOffsets === 'object'
         ? obj.claudeFileOffsets
+        : {},
+    antigravityFileOffsets:
+      obj.antigravityFileOffsets && typeof obj.antigravityFileOffsets === 'object'
+        ? obj.antigravityFileOffsets
         : {}
   }
 }
@@ -739,7 +746,8 @@ export function applySnapshot(
   now: number,
   maxLedgerEntries = 300,
   directProviderDeltas?: Record<string, Record<string, ModelTokenUsage>>,
-  nextClaudeFileOffsets?: Record<string, number>
+  nextClaudeFileOffsets?: Record<string, number>,
+  nextAntigravityFileOffsets?: Record<string, number>
 ): TrackerState {
   const isBaseline = prevState.lastPollAt === null
   const nextSessionTokens: Record<string, StoredSessionBaseline> = { ...prevState.sessionTokens }
@@ -861,15 +869,27 @@ export function applySnapshot(
   for (const sample of quotas) {
     const key = `${sample.provider}::${sample.accountId}::${sample.windowId}`
     const existing = prevState.windows[key]
-    const providerDeltaTokens = sample.isActiveAccount
-      ? (deltaTokensByProvider[sample.provider] ?? 0)
-      : 0
-    const providerDeltaCost = sample.isActiveAccount
-      ? (deltaCostByProvider[sample.provider] ?? 0)
-      : 0
-    const providerDeltaModels = sample.isActiveAccount
+    const rawProviderModels = sample.isActiveAccount
       ? (deltaModelsByProvider[sample.provider] ?? {})
       : {}
+    const providerDeltaModels = filterModelsForWindow(
+      sample.provider,
+      sample.windowId,
+      sample.windowLabel,
+      rawProviderModels
+    )
+    const isFilteredBucket = sample.provider === 'antigravity'
+    let providerDeltaTokens = 0
+    let providerDeltaCost = 0
+    if (isFilteredBucket) {
+      for (const u of Object.values(providerDeltaModels)) {
+        providerDeltaTokens += u.totalTokens
+        providerDeltaCost += u.costUsd
+      }
+    } else if (sample.isActiveAccount) {
+      providerDeltaTokens = deltaTokensByProvider[sample.provider] ?? 0
+      providerDeltaCost = deltaCostByProvider[sample.provider] ?? 0
+    }
     const titles = sample.isActiveAccount ? (sessionTitlesByProvider[sample.provider] ?? []) : []
 
     if (!existing || isQuotaReset(existing, sample)) {
@@ -983,7 +1003,8 @@ export function applySnapshot(
     ledger: nextLedger.slice(0, maxLedgerEntries),
     periodStats: nextPeriodStats,
     sessionTokens: nextSessionTokens,
-    claudeFileOffsets: nextClaudeFileOffsets ?? prevState.claudeFileOffsets
+    claudeFileOffsets: nextClaudeFileOffsets ?? prevState.claudeFileOffsets,
+    antigravityFileOffsets: nextAntigravityFileOffsets ?? prevState.antigravityFileOffsets
   }
 }
 

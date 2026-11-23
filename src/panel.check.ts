@@ -117,7 +117,8 @@ const populatedState: TrackerState = {
     }
   },
   sessionTokens: {},
-  claudeFileOffsets: {}
+  claudeFileOffsets: {},
+  antigravityFileOffsets: {}
 }
 
 export default defineCheck({

@@ -1,4 +1,8 @@
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import {
+  filterModelsForWindow,
+  parseAntigravityTranscriptContent
+} from './antigravity-logs'
 import { parseClaudeJsonlContent } from './claude-logs'
 import {
   applySnapshot,
@@ -72,6 +76,46 @@ test('parses Claude JSONL deduplicating multi-block messages and computes model 
   assert.equal(Number(models['claude-opus-5-5'].costUsd.toFixed(4)), 0.18)
   // Sonnet 5.5: $3 in, $15 out => (10000*3 + 10000*15)/1e6 = $0.18
   assert.equal(Number(models['claude-sonnet-5-5'].costUsd.toFixed(4)), 0.18)
+})
+
+test('parses Antigravity transcript.jsonl and routes models to matching quota buckets', () => {
+  const transcript = [
+    JSON.stringify({
+      step_index: 1,
+      model: 'gemini-4-neon-medium',
+      input_tokens: 100_000,
+      cache_read_tokens: 200_000,
+      output_tokens: 10_000
+    }),
+    JSON.stringify({
+      step_index: 2,
+      model: 'claude-opus-5-5',
+      input_tokens: 10_000,
+      cache_read_tokens: 0,
+      output_tokens: 5_000
+    })
+  ].join('\n')
+
+  const models = parseAntigravityTranscriptContent(transcript)
+  assert.equal(Object.keys(models).length, 2)
+  assert.equal(models['gemini-4-neon-medium'].totalTokens, 310_000)
+  assert.ok(models['gemini-4-neon-medium'].costUsd > 0)
+
+  const geminiOnly = filterModelsForWindow(
+    'antigravity',
+    'bucket:gemini_models_weekly',
+    'Gemini Models · Weekly',
+    models
+  )
+  assert.deepEqual(Object.keys(geminiOnly), ['gemini-4-neon-medium'])
+
+  const claudeGptOnly = filterModelsForWindow(
+    'antigravity',
+    'bucket:claude_and_gpt_models_weekly',
+    'Claude and GPT models · Weekly',
+    models
+  )
+  assert.deepEqual(Object.keys(claudeGptOnly), ['claude-opus-5-5'])
 })
 
 test('parses orca account list --json output across providers and buckets', () => {
