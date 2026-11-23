@@ -789,12 +789,15 @@ export function applySnapshot(
       }
     }
 
-    nextSessionTokens[s.sessionId] = {
+    const baseline: StoredSessionBaseline = {
       agent: s.agent,
       totalTokens: s.totalTokens,
-      updatedAt: s.updatedAt,
-      models: s.models ? { ...s.models } : undefined
+      updatedAt: s.updatedAt
     }
+    if (s.models) {
+      baseline.models = { ...s.models }
+    }
+    nextSessionTokens[s.sessionId] = baseline
   }
 
   const sessionEntries = Object.entries(nextSessionTokens)

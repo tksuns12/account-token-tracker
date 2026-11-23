@@ -26,6 +26,11 @@ const DEFAULT_POLL_SEC = 60
 const DEFAULT_MAX_LEDGER = 300
 const DEFAULT_NERF_ALERT_DROP = 15
 
+/** Strips any `undefined` keys or non-finite numbers so Orca's strict JSON validator always accepts the payload. */
+function toPlainJson<T>(value: T): Record<string, never> {
+  return JSON.parse(JSON.stringify(value)) as Record<string, never>
+}
+
 export type AccountListFetcher = () => Promise<QuotaWindowSample[]>
 export type LocalClaudeDeltaFetcher = (
   prevOffsets: Record<string, number>,
@@ -208,18 +213,18 @@ async function runRefresh(orca: OrcaWorkerApi): Promise<DashboardView> {
         usageData.directProviderDeltas,
         usageData.nextClaudeOffsets
       )
-      await orca.storage.set(STATE_KEY, next as unknown as Record<string, never>)
+      await orca.storage.set(STATE_KEY, toPlainJson(next))
       const view = buildDashboardView(next, nerfAlertDropPercent)
       await updateStatusBar(orca, view)
-      orca.panels.post('tracker.updated', view as unknown as Record<string, never>)
+      orca.panels.post('tracker.updated', toPlainJson(view))
       return view
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       orca.log(`snapshot failed: ${message}`)
       const errored: TrackerState = { ...prev, lastError: message }
-      await orca.storage.set(STATE_KEY, errored as unknown as Record<string, never>)
+      await orca.storage.set(STATE_KEY, toPlainJson(errored))
       const view = buildDashboardView(errored, nerfAlertDropPercent)
-      orca.panels.post('tracker.updated', view as unknown as Record<string, never>)
+      orca.panels.post('tracker.updated', toPlainJson(view))
       return view
     } finally {
       inFlightRefresh = null

@@ -305,7 +305,24 @@ test('worker refreshes using local Claude logs and exports trends CSV with USD',
   try {
     const host = mockHost({
       results: {
-        'agent.listSessions': () => ({ sessions: [], truncated: false })
+        'agent.listSessions': () => ({
+          sessions: [
+            {
+              sessionId: 'codex-1',
+              agent: 'codex',
+              title: 'Codex task',
+              workspaceId: null,
+              hostId: 'local',
+              branch: null,
+              createdAt: Date.now() - 500,
+              updatedAt: Date.now(),
+              messageCount: 2,
+              totalTokens: 5000,
+              running: false
+            }
+          ],
+          truncated: false
+        })
       }
     })
 
