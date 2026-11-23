@@ -1,13 +1,11 @@
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
-import {
-  filterModelsForWindow,
-  parseAntigravityTranscriptContent
-} from './antigravity-logs'
+import { parseAntigravityTranscriptContent } from './antigravity-logs'
 import { parseClaudeJsonlContent } from './claude-logs'
 import {
   applySnapshot,
   buildDashboardView,
   createEmptyState,
+  filterModelsForWindow,
   getIsoWeekKey,
   getMonthKey,
   migrateState,

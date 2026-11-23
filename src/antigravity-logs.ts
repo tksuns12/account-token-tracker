@@ -239,38 +239,3 @@ export function scanAntigravityLocalDeltas(
     hasLocalLogs: true
   }
 }
-
-/**
- * Filters Antigravity model deltas to the specific quota bucket they consume
- * (e.g., Gemini Models vs Claude & GPT models vs Gemini 4 Argon).
- */
-export function filterModelsForWindow(
-  provider: string,
-  windowId: string,
-  windowLabel: string,
-  models: Record<string, ModelTokenUsage>
-): Record<string, ModelTokenUsage> {
-  if (provider !== 'antigravity') return models
-  const w = `${windowId} ${windowLabel}`.toLowerCase()
-
-  const isArgonBucket = w.includes('argon')
-  const isClaudeGptBucket = w.includes('claude') || w.includes('gpt')
-  const isGeminiBucket = w.includes('gemini') && !isArgonBucket
-
-  if (!isArgonBucket && !isClaudeGptBucket && !isGeminiBucket) {
-    return models
-  }
-
-  const out: Record<string, ModelTokenUsage> = {}
-  for (const [model, usage] of Object.entries(models)) {
-    const m = model.toLowerCase()
-    if (isArgonBucket) {
-      if (m.includes('argon')) out[model] = usage
-    } else if (isClaudeGptBucket) {
-      if (/claude|opus|sonnet|haiku|fable|gpt|o[134]/.test(m)) out[model] = usage
-    } else if (isGeminiBucket) {
-      if (m.includes('gemini') && !m.includes('argon')) out[model] = usage
-    }
-  }
-  return out
-}
