@@ -276,7 +276,17 @@ export function getMonthKey(timestampMs: number): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
 }
 
+const MINUTES_PER_WEEK = 7 * 24 * 60 // 10,080 minutes (7 days)
 const MINUTES_PER_MONTH = 30 * 24 * 60 // 43,200 minutes (30 days)
+
+/** Returns true for weekly/monthly pacing windows; false for short burst windows like 5h sessions. */
+export function isMonthlyValueEligibleWindow(
+  windowMinutes: number | null | undefined,
+  windowId: string,
+  windowLabel: string
+): boolean {
+  return inferWindowMinutes(windowMinutes, windowId, windowLabel) >= MINUTES_PER_WEEK
+}
 
 /** Resolves a quota window's length in minutes from explicit metadata or its id/label. */
 export function inferWindowMinutes(
@@ -1062,6 +1072,10 @@ function buildTrendsForGranularity(
 
   for (const stat of Object.values(periodStats)) {
     if (stat.periodType !== periodType || stat.totalDeltaPercent <= 0) continue
+    // Exclude short-term burst windows (e.g. 5h) that are subordinate to weekly/monthly caps
+    if (!isMonthlyValueEligibleWindow(stat.windowMinutes, stat.windowId, stat.windowLabel)) {
+      continue
+    }
     const seriesKey = `${stat.provider}::${stat.accountId}::${stat.windowId}`
     const list = bySeries.get(seriesKey) ?? []
     list.push(stat)

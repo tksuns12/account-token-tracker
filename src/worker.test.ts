@@ -274,6 +274,35 @@ test('tracks per-model USD per 1% and detects enshittification drop in $/1%', ()
   // Verify week/month keys
   assert.ok(state.periodStats[`week::${getIsoWeekKey(week1 + 60_000)}::claude::acc-1::weekly`])
   assert.ok(state.periodStats[`month::${getMonthKey(week2)}::claude::acc-1::weekly`])
+
+  // Verify 5h burst windows are excluded from monthly-value trends
+  const stateWith5h = {
+    ...state,
+    periodStats: {
+      ...state.periodStats,
+      'week::2026-W47::antigravity::host::bucket:gemini_models_five_hour': {
+        key: 'week::2026-W47::antigravity::host::bucket:gemini_models_five_hour',
+        periodType: 'week' as const,
+        periodKey: '2026-W47',
+        provider: 'antigravity',
+        accountId: 'host',
+        accountLabel: 'Antigravity (host)',
+        windowId: 'bucket:gemini_models_five_hour',
+        windowLabel: 'Gemini Models · Five Hour',
+        windowMinutes: 300,
+        totalDeltaPercent: 20,
+        totalDeltaTokens: 1_000_000,
+        totalDeltaCostUsd: 10,
+        models: {},
+        sampleCount: 5,
+        firstTimestamp: week2,
+        lastTimestamp: week2
+      }
+    }
+  }
+  const filteredView = buildDashboardView(stateWith5h, 15)
+  assert.equal(filteredView.weeklySeries.length, 1)
+  assert.equal(filteredView.weeklySeries[0].windowId, 'weekly')
 })
 
 test('migrates v1 state cleanly to v3 and custom pricing overrides work', () => {
