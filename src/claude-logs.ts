@@ -27,7 +27,10 @@ export interface ClaudeDeltaScanResult {
   hasLocalLogs: boolean
 }
 
-const MAX_RECENT_MESSAGES = 250
+const MAX_RECENT_MESSAGES = 150
+const MAX_STORED_OFFSETS = 200
+const OFFSET_RETENTION_MS = 48 * 60 * 60 * 1000
+const RESUMED_TAIL_BYTES = 256 * 1024
 
 function asNonNegInt(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0
@@ -290,10 +293,12 @@ export function scanClaudeLocalDeltas(
 
   // Guard against historical backfill when upgrading from a state with no recorded file offsets.
   const effectiveBaseline = isBaseline || Object.keys(prevOffsets).length === 0
-  const nextOffsets: Record<string, number> = {}
+  const now = Date.now()
+  const retentionCutoff = now - OFFSET_RETENTION_MS
+  const candidateOffsets: Array<{ key: string; offset: number; mtimeMs: number }> = []
   let currentMessageUsage: Record<string, MessageUsageWatermark> = { ...prevMessageUsage }
   let deltaModels: Record<string, ModelTokenUsage> = {}
-  const newFileCutoff = (lastPollAt ?? Date.now()) - 60_000
+  const newFileCutoff = (lastPollAt ?? now) - 60_000
 
   for (const filePath of files) {
     let stat: fs.Stats
@@ -307,7 +312,9 @@ export function scanClaudeLocalDeltas(
     const prevOffset = prevOffsets[relKey]
 
     if (effectiveBaseline) {
-      nextOffsets[relKey] = stat.size
+      if (stat.mtimeMs >= retentionCutoff) {
+        candidateOffsets.push({ key: relKey, offset: stat.size, mtimeMs: stat.mtimeMs })
+      }
       continue
     }
 
@@ -318,28 +325,34 @@ export function scanClaudeLocalDeltas(
       if (stat.size > prevOffset) {
         readStart = prevOffset
       } else {
-        nextOffsets[relKey] = stat.size
+        if (stat.mtimeMs >= retentionCutoff) {
+          candidateOffsets.push({ key: relKey, offset: stat.size, mtimeMs: stat.mtimeMs })
+        }
         continue
       }
-    } else {
+    } else if (stat.mtimeMs >= newFileCutoff) {
       const birthMs =
         typeof stat.birthtimeMs === 'number' && stat.birthtimeMs > 0 ? stat.birthtimeMs : null
-      const isTrulyNewFile =
-        birthMs !== null ? birthMs >= newFileCutoff : stat.mtimeMs >= newFileCutoff
+      const isTrulyNewFile = birthMs !== null && birthMs >= newFileCutoff
 
       if (isTrulyNewFile) {
         readStart = 0
         filterSinceMs = newFileCutoff
       } else {
-        // Pre-existing/resumed session not yet in offsets: start from EOF to avoid historical backfill
-        nextOffsets[relKey] = stat.size
-        continue
+        // Resumed older session outside retention window: tail recent bytes with timestamp filter
+        readStart = Math.max(0, stat.size - RESUMED_TAIL_BYTES)
+        filterSinceMs = newFileCutoff
       }
+    } else {
+      if (stat.mtimeMs >= retentionCutoff) {
+        candidateOffsets.push({ key: relKey, offset: stat.size, mtimeMs: stat.mtimeMs })
+      }
+      continue
     }
 
     try {
       const { text, nextOffset } = readNewLines(filePath, readStart, stat.size, maxBytes)
-      nextOffsets[relKey] = nextOffset
+      candidateOffsets.push({ key: relKey, offset: nextOffset, mtimeMs: stat.mtimeMs })
       if (text.length > 0) {
         const res = parseClaudeJsonlIncremental(text, overrides, {
           sinceMs: filterSinceMs,
@@ -349,8 +362,15 @@ export function scanClaudeLocalDeltas(
         deltaModels = mergeModelUsageMaps(deltaModels, res.models)
       }
     } catch {
-      nextOffsets[relKey] = prevOffset ?? stat.size
+      candidateOffsets.push({ key: relKey, offset: prevOffset ?? stat.size, mtimeMs: stat.mtimeMs })
     }
+  }
+
+  // Keep only the most recently active files so persisted offsets stay tiny (<20 KiB)
+  candidateOffsets.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const nextOffsets: Record<string, number> = {}
+  for (const item of candidateOffsets.slice(0, MAX_STORED_OFFSETS)) {
+    nextOffsets[item.key] = item.offset
   }
 
   let deltaTokens = 0

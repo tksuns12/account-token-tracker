@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "account-token-tracker",
   "name": "Account Token Tracker",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Track per-account quota % vs real API dollar value ($/mo), visualize model cost mix, and detect silent quota nerfs week-over-week.",
   "author": {
     "name": "tksuns12",

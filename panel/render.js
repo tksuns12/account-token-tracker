@@ -784,7 +784,7 @@
     const canExport =
       uiState.activeTab === 'trends'
         ? (uiState.granularity === 'month' ? view.monthlyRows : view.weeklyRows || []).length > 0
-        : (view.ledger || []).length > 0
+        : (view.ledgerViews || view.ledger || []).length > 0
 
     let bodyHtml = ''
     if (uiState.activeTab === 'trends') {
@@ -892,7 +892,7 @@
 
       <footer class="footer">
         <span>모델 단가 · 경고 기준은 플러그인 설정에서 변경</span>
-        <span class="mono">v0.4.0</span>
+        <span class="mono">v0.4.1</span>
       </footer>
     `
   }

@@ -18,7 +18,9 @@ export interface AntigravityDeltaScanResult {
   hasLocalLogs: boolean
 }
 
-const MAX_SEEN_STEPS = 250
+const MAX_SEEN_STEPS = 150
+const MAX_STORED_OFFSETS = 150
+const OFFSET_RETENTION_MS = 48 * 60 * 60 * 1000
 
 function asNonNegInt(v: unknown): number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0
@@ -226,9 +228,11 @@ export function scanAntigravityLocalDeltas(
 
   const maxBytes = options?.maxReadBytesPerFile ?? 8 * 1024 * 1024
   const effectiveBaseline = isBaseline || Object.keys(prevOffsets).length === 0
-  const nextOffsets: Record<string, number> = {}
+  const now = Date.now()
+  const retentionCutoff = now - OFFSET_RETENTION_MS
+  const candidateOffsets: Array<{ key: string; offset: number; mtimeMs: number }> = []
   let deltaModels: Record<string, ModelTokenUsage> = {}
-  const newFileCutoff = (lastPollAt ?? Date.now()) - 60_000
+  const newFileCutoff = (lastPollAt ?? now) - 60_000
 
   for (const { key, filePath } of files) {
     let stat: fs.Stats
@@ -240,7 +244,9 @@ export function scanAntigravityLocalDeltas(
 
     const prevOffset = prevOffsets[key]
     if (effectiveBaseline) {
-      nextOffsets[key] = stat.size
+      if (stat.mtimeMs >= retentionCutoff) {
+        candidateOffsets.push({ key, offset: stat.size, mtimeMs: stat.mtimeMs })
+      }
       continue
     }
 
@@ -251,7 +257,9 @@ export function scanAntigravityLocalDeltas(
       if (stat.size > prevOffset) {
         readStart = prevOffset
       } else {
-        nextOffsets[key] = stat.size
+        if (stat.mtimeMs >= retentionCutoff) {
+          candidateOffsets.push({ key, offset: stat.size, mtimeMs: stat.mtimeMs })
+        }
         continue
       }
     } else {
@@ -263,14 +271,16 @@ export function scanAntigravityLocalDeltas(
         readStart = 0
         filterSinceMs = newFileCutoff
       } else {
-        nextOffsets[key] = stat.size
+        if (stat.mtimeMs >= retentionCutoff) {
+          candidateOffsets.push({ key, offset: stat.size, mtimeMs: stat.mtimeMs })
+        }
         continue
       }
     }
 
     try {
       const { text, nextOffset } = readNewLines(filePath, readStart, stat.size, maxBytes)
-      nextOffsets[key] = nextOffset
+      candidateOffsets.push({ key, offset: nextOffset, mtimeMs: stat.mtimeMs })
       if (text.length > 0) {
         const parsed = parseAntigravityTranscriptContent(text, overrides, {
           sinceMs: filterSinceMs,
@@ -280,8 +290,14 @@ export function scanAntigravityLocalDeltas(
         deltaModels = mergeModelUsageMaps(deltaModels, parsed)
       }
     } catch {
-      nextOffsets[key] = prevOffset ?? stat.size
+      candidateOffsets.push({ key, offset: prevOffset ?? stat.size, mtimeMs: stat.mtimeMs })
     }
+  }
+
+  candidateOffsets.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const nextOffsets: Record<string, number> = {}
+  for (const item of candidateOffsets.slice(0, MAX_STORED_OFFSETS)) {
+    nextOffsets[item.key] = item.offset
   }
 
   let deltaTokens = 0

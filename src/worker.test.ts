@@ -724,3 +724,75 @@ test('worker refreshes using local Claude logs and exports trends CSV with USD',
     main.setClaudeDeltaFetcherForTests(null)
   }
 })
+
+test('shards storage keys and keeps every storage write & panel payload under 256 KiB', async () => {
+  // Simulate legacy trackerState with huge offset map (>200 KiB alone)
+  const hugeOffsets: Record<string, number> = {}
+  for (let i = 0; i < 1200; i++) {
+    hugeOffsets[`-Users-demo-very-long-workspace-path-project-${i}/session-${i}-uuid-1234567890.jsonl`] =
+      100_000 + i
+  }
+
+  main.setAccountListFetcherForTests(async () => [
+    {
+      provider: 'claude',
+      accountId: 'acc-1',
+      accountLabel: 'Claude (max_20x)',
+      planType: 'max_20x',
+      isActiveAccount: true,
+      windowId: 'weekly',
+      windowLabel: 'Weekly (7d)',
+      windowMinutes: 10080,
+      usedPercent: 30,
+      resetsAt: 2_000_000_000_000,
+      resetDescription: 'Thu 9:00 PM'
+    }
+  ])
+  main.setClaudeDeltaFetcherForTests(() => ({
+    nextOffsets: hugeOffsets,
+    nextMessageUsage: {},
+    deltaModels: {},
+    deltaTokens: 0,
+    deltaCostUsd: 0,
+    hasLocalLogs: true
+  }))
+
+  try {
+    const host = mockHost({
+      storage: {
+        trackerState: {
+          version: 3,
+          lastPollAt: Date.now() - 60_000,
+          lastError: null,
+          windows: {},
+          ledger: [],
+          periodStats: {},
+          sessionTokens: {},
+          claudeFileOffsets: {},
+          antigravityFileOffsets: {}
+        }
+      }
+    })
+
+    const worker = await mountWorker(main, { host })
+    const panelPayload = await worker.request('tracker.refresh')
+
+    const storage = host.data().storage
+    assert.ok(storage.trackerCore)
+    assert.ok(storage.trackerLedger)
+    assert.ok(storage.trackerLogCursors)
+    assert.equal(storage.trackerState, undefined)
+
+    for (const [key, val] of Object.entries(storage)) {
+      const bytes = Buffer.byteLength(JSON.stringify(val), 'utf8')
+      assert.ok(bytes < 262_144, `storage key ${key} exceeded 256 KiB (${bytes})`)
+    }
+    const payloadBytes = Buffer.byteLength(JSON.stringify(panelPayload), 'utf8')
+    assert.ok(payloadBytes < 262_144, `panel payload exceeded 256 KiB (${payloadBytes})`)
+    assert.deepEqual(worker.refusals, [])
+    await worker.deactivate()
+  } finally {
+    main.setAccountListFetcherForTests(null)
+    main.setClaudeDeltaFetcherForTests(null)
+  }
+})
